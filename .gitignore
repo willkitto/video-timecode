@@ -1,0 +1,6 @@
+# personal saved choices
+VideoTimecode.settings.json
+# bundled binaries / build output
+ffmpeg.exe
+ffprobe.exe
+dist/
