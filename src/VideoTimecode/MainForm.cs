@@ -226,10 +226,13 @@ sealed class MainForm : Form
         grid.BorderStyle = BorderStyle.FixedSingle;
         grid.Columns.AddRange(
             new DataGridViewCheckBoxColumn { Name = "On", DataPropertyName = nameof(Overlay.Enabled), HeaderText = "On", FillWeight = 7 },
-            new DataGridViewComboBoxColumn
+            // A button with a menu rather than a combo box: the grid parks combo editors
+            // off-screen, and WinForms then fails to rescale them when the window moves to
+            // a monitor with different scaling ("Error creating window handle")
+            new DataGridViewButtonColumn
             {
-                Name = "Position", DataPropertyName = nameof(Overlay.Position), HeaderText = "Position", FillWeight = 22,
-                DataSource = Positions, DisplayMember = nameof(PosItem.Name), ValueMember = nameof(PosItem.Value), FlatStyle = FlatStyle.Flat,
+                Name = "Position", HeaderText = "Position", FillWeight = 22, FlatStyle = FlatStyle.Flat,
+                DefaultCellStyle = { Alignment = DataGridViewContentAlignment.MiddleLeft },
             },
             new DataGridViewTextBoxColumn { Name = "Text", DataPropertyName = nameof(Overlay.Text), HeaderText = "Text  ({tokens} are filled in per frame)", FillWeight = 52 },
             new DataGridViewTextBoxColumn { Name = "Size", DataPropertyName = nameof(Overlay.Size), HeaderText = "Size %", FillWeight = 9 },
@@ -242,9 +245,9 @@ sealed class MainForm : Form
         var tokenMenu = new ContextMenuStrip();
         foreach (var (token, desc) in Template.Tokens)
             tokenMenu.Items.Add($"{token}   {desc}", null, (_, _) => InsertToken(token));
-        var btnAdd = new Button { Text = "Add overlay  ▾", Width = 120, Height = 28 };
+        var btnAdd = new Button { Text = "Add overlay  â–¾", Width = 120, Height = 28 };
         btnAdd.Click += (_, _) => addMenu.Show(btnAdd, new Point(0, btnAdd.Height));
-        var btnToken = new Button { Text = "Insert token  ▾", Width = 120, Height = 28 };
+        var btnToken = new Button { Text = "Insert token  â–¾", Width = 120, Height = 28 };
         btnToken.Click += (_, _) => tokenMenu.Show(btnToken, new Point(0, btnToken.Height));
         var overlayButtons = Flow(btnAdd, btnToken,
             Btn("Remove", (_, _) => RemoveOverlay(), 80),
@@ -361,7 +364,7 @@ sealed class MainForm : Form
 
         grid.CurrentCellDirtyStateChanged += (_, _) =>
         {
-            if (grid.IsCurrentCellDirty && grid.CurrentCell?.OwningColumn?.Name is "On" or "Position")
+            if (grid.IsCurrentCellDirty && grid.CurrentCell?.OwningColumn?.Name == "On")
                 grid.CommitEdit(DataGridViewDataErrorContexts.Commit);
         };
         grid.CellValueChanged += (_, _) => preview.Invalidate();
@@ -376,6 +379,12 @@ sealed class MainForm : Form
         };
         grid.CellFormatting += (_, e) =>
         {
+            if (e.RowIndex >= 0 && e.RowIndex < overlays.Count && grid.Columns[e.ColumnIndex].Name == "Position")
+            {
+                var pos = overlays[e.RowIndex].Position;
+                e.Value = (Positions.FirstOrDefault(p => p.Value == pos)?.Name ?? pos.ToString()) + "  â–¾";
+                e.FormattingApplied = true;
+            }
             if (e.RowIndex >= 0 && grid.Columns[e.ColumnIndex].Name == "Color" && e.CellStyle != null)
             {
                 var c = ColorUtil.Parse(e.Value as string);
@@ -383,16 +392,12 @@ sealed class MainForm : Form
                 e.CellStyle.ForeColor = e.CellStyle.SelectionForeColor = ColorUtil.Contrasting(c);
             }
         };
-        grid.CellContentClick += (_, e) =>
+        // Any click in the cell (CellContentClick misses some clicks), or Space/Enter
+        grid.CellClick += (_, e) => CellButton(e.RowIndex, e.ColumnIndex);
+        grid.KeyDown += (_, e) =>
         {
-            if (e.RowIndex < 0 || grid.Columns[e.ColumnIndex].Name != "Color") return;
-            var o = overlays[e.RowIndex];
-            if (PickColor(o.Color) is { } hex)
-            {
-                o.Color = hex;
-                grid.InvalidateRow(e.RowIndex);
-                preview.Invalidate();
-            }
+            if (e.KeyCode is Keys.Space or Keys.Enter && grid.CurrentCell is { } c && CellButton(c.RowIndex, c.ColumnIndex))
+                e.Handled = true;
         };
 
         cbFont.SelectedIndexChanged += (_, _) => preview.Invalidate();
@@ -723,6 +728,50 @@ sealed class MainForm : Form
         overlays.Add(new Overlay { Text = text, Size = size, Position = pos, Color = "#FFFFFF" });
         grid.CurrentCell = grid.Rows[overlays.Count - 1].Cells["Text"];
         preview.Invalidate();
+    }
+
+    // Position and Color cells act as buttons; returns true if one was handled
+    bool CellButton(int row, int col)
+    {
+        if (row < 0 || row >= overlays.Count || col < 0) return false;
+        switch (grid.Columns[col].Name)
+        {
+            case "Position":
+                // After the grid finishes handling the click, or it takes focus back and closes the menu
+                BeginInvoke(() => ShowPositionMenu(row, col));
+                return true;
+            case "Color":
+                var o = overlays[row];
+                if (PickColor(o.Color) is { } hex)
+                {
+                    o.Color = hex;
+                    grid.InvalidateRow(row);
+                    preview.Invalidate();
+                }
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    void ShowPositionMenu(int row, int col)
+    {
+        var o = overlays[row];
+        var menu = new ContextMenuStrip();
+        foreach (var p in Positions)
+        {
+            var item = new ToolStripMenuItem(p.Name) { Checked = p.Value == o.Position };
+            item.Click += (_, _) =>
+            {
+                o.Position = p.Value;
+                grid.InvalidateRow(row);
+                preview.Invalidate();
+            };
+            menu.Items.Add(item);
+        }
+        menu.Closed += (_, _) => BeginInvoke(menu.Dispose);
+        var r = grid.GetCellDisplayRectangle(col, row, false);
+        menu.Show(grid, new Point(r.Left, r.Bottom));
     }
 
     void InsertToken(string token)
