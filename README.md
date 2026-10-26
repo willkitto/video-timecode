@@ -34,7 +34,7 @@ pick a style, and click Run.
   - audio is always copied untouched, as are metadata, chapters and camera timecode
 - **Uses your GPUs automatically on any PC.** It tests every NVIDIA (NVENC), AMD (AMF) and Intel (Quick Sync) encoder present, checking the real output format, and runs several videos at once across them. If a GPU can't handle a file, that file is retried on another GPU, then on the CPU.
 - **Daylight saving time handled** for the recording date, frame by frame across a clock change.
-- **Remembers your settings.** A second launcher reruns with them and skips the window.
+- **Presets:** save any number of named setups, switch between them from the top of the window, and give any preset its own drag-and-drop shortcut. The last run's settings are always available too.
 
 ## Download
 
@@ -51,7 +51,37 @@ Requires 64-bit Windows 10 or 11. Nothing else needs installing.
 | Drop videos on | What happens |
 |---|---|
 | `VideoTimecode.exe` | Opens the window. Pick options, click **Run**, and your choices are saved. |
-| `Video Timecode - use last settings.bat` | Starts processing right away with the saved choices |
+| `Video Timecode - use last settings.bat` | Starts processing right away with the last run's settings |
+| `Video Timecode - <preset>.bat` | Starts processing right away with that preset. Create these from **More** in the window. |
+
+## Presets
+
+The **Preset** bar at the top of the window holds your saved setups. A preset stores every
+choice in the window: output type, encoding options, overlays, style and time settings.
+
+| Entry | What it is |
+|---|---|
+| **Last run** | The settings used by the most recent Run, saved automatically. This is what the window opens with. |
+| **Defaults** | The factory settings |
+| *Your presets* | Saved with **Save as...**. **Save** updates the selected preset with the current settings. |
+
+Choosing an entry loads its settings into the window. **More** has *Rename*, *Delete*, *Open
+presets folder*, and **Create drag-and-drop shortcut**. That last option writes
+`Video Timecode - <preset>.bat` next to `VideoTimecode.exe`. Drop videos on it to process them
+with that preset straight away, without opening the options.
+
+### Where settings are stored
+
+Everything lives in `%LOCALAPPDATA%\VideoTimecode` (for example
+`C:\Users\<you>\AppData\Local\VideoTimecode`):
+
+| File | Contents |
+|---|---|
+| `settings.json` | Last run's settings, written each time you click Run |
+| `presets\<name>.json` | One file per preset. Copy these to another PC to share presets. |
+| `encoders.json` | Which GPU encoders this PC has (re-checked when the GPUs or FFmpeg change) |
+| `last-run.log`, `error.log` | Details of the last run, and of any unexpected errors |
+| `ffmpeg\` | FFmpeg, if the app downloaded it |
 
 ## Output files
 
@@ -108,11 +138,12 @@ device, film a clock that shows seconds and compare it with the timecode.
 ## Command line
 
 ```
-VideoTimecode.exe [--use-saved [--exit-when-done]] [files or folders...]
+VideoTimecode.exe [--use-saved | --preset "Name"] [--exit-when-done] [files or folders...]
 ```
 
-- `--use-saved` starts straight away with the saved settings.
-- `--exit-when-done` closes the window when finished, which is handy in scripts.
+- `--use-saved` starts straight away with the last run's settings.
+- `--preset "Name"` starts straight away with a saved preset.
+- `--exit-when-done` closes the window when finished (with either option above), which is handy in scripts.
 - The `VIDEO_TIMECODE_HOME` environment variable moves settings, logs and FFmpeg to another folder (e.g. for a portable setup).
 
 ## Troubleshooting

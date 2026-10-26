@@ -20,7 +20,7 @@ sealed class MainForm : Form
     };
 
     // Ready-made overlays for the Add menu: (menu text, overlay text, size %)
-    static readonly (string Name, string Text, double Size)[] Presets =
+    static readonly (string Name, string Text, double Size)[] OverlayPresets =
     {
         ("Date and time", "{datetime}", 5),
         ("Elapsed time", "{elapsed}", 4),
@@ -39,8 +39,10 @@ sealed class MainForm : Form
         Anchor9.TopCenter, Anchor9.BottomCenter, Anchor9.MiddleLeft, Anchor9.MiddleRight, Anchor9.Center,
     };
 
-    readonly AppSettings settings;
+    AppSettings settings;
     readonly bool quickRun;
+    string? startupWarning;
+    bool loadingPresets;
     readonly BindingList<Overlay> overlays;
     readonly string logPath = Path.Combine(AppSettings.Dir, "last-run.log");
     List<Worker>? workers;
@@ -72,15 +74,28 @@ sealed class MainForm : Form
     readonly LinkLabel lnkLog = new() { Text = "Open log", AutoSize = true, Visible = false, Anchor = AnchorStyles.Left };
     readonly Button btnRun = new() { Text = "Run", Width = 100, Height = 32 };
     readonly Button btnCancel = new() { Text = "Close", Width = 100, Height = 32 };
-    Control fileButtons = null!, outputPanel = null!, encodePanel = null!, timePanel = null!, rightPanel = null!;
+    readonly ComboBox cbPreset = Drop(280);
+    readonly Button btnSavePreset = new() { Text = "Save", Width = 80, Height = 28 };
+    readonly Button btnMorePreset = new() { Text = "More  \u25BE", Width = 90, Height = 28 };
+    Control fileButtons = null!, outputPanel = null!, encodePanel = null!, timePanel = null!, rightPanel = null!, presetBar = null!;
 
     static ComboBox Drop(int width = 260) => new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = width };
 
-    public MainForm(IEnumerable<string> paths, bool useSaved, bool exitWhenDone)
+    public MainForm(IEnumerable<string> paths, bool useSaved, string? preset, bool exitWhenDone)
     {
-        quickRun = useSaved && AppSettings.Exists;
-        closeWhenDone = quickRun && exitWhenDone;
         settings = AppSettings.Load();
+        string? startPreset = null;
+        if (preset != null)
+        {
+            if (Presets.Load(preset) is { } p)
+            {
+                settings = p;
+                startPreset = Presets.Names().FirstOrDefault(n => n.Equals(preset, StringComparison.OrdinalIgnoreCase)) ?? preset;
+            }
+            else startupWarning = $"There is no preset called \"{preset}\", so nothing was started.\n\nPick a preset at the top of the window, or save one with \"Save as\".";
+        }
+        quickRun = startPreset != null || (useSaved && AppSettings.Exists);
+        closeWhenDone = quickRun && exitWhenDone;
         overlays = new BindingList<Overlay>(settings.Overlays.Select(o => o.Clone()).ToList());
         edgeColor = settings.EdgeColor;
 
@@ -95,20 +110,25 @@ sealed class MainForm : Form
         AllowDrop = true;
         try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
 
-        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 2, Padding = new Padding(10) };
+        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 3, Padding = new Padding(10) };
         root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 46));
         root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 54));
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        root.Controls.Add(BuildLeft(), 0, 0);
-        root.Controls.Add(rightPanel = BuildRight(), 1, 0);
+        presetBar = BuildPresetBar();
+        root.Controls.Add(presetBar, 0, 0);
+        root.SetColumnSpan(presetBar, 2);
+        root.Controls.Add(BuildLeft(), 0, 1);
+        root.Controls.Add(rightPanel = BuildRight(), 1, 1);
         var bottom = BuildBottom();
-        root.Controls.Add(bottom, 0, 1);
+        root.Controls.Add(bottom, 0, 2);
         root.SetColumnSpan(bottom, 2);
         Controls.Add(root);
         ResumeLayout(true);
 
         LoadUi();
+        RefreshPresets(startPreset ?? Presets.LastRun);
         AddPaths(paths);
         WireEvents();
     }
@@ -166,6 +186,43 @@ sealed class MainForm : Form
         var b = new Button { Text = text, Width = width, Height = 28 };
         b.Click += onClick;
         return b;
+    }
+
+    Control BuildPresetBar()
+    {
+        var more = new ContextMenuStrip();
+        var miRename = new ToolStripMenuItem("Rename...", null, (_, _) => RenamePreset());
+        var miDelete = new ToolStripMenuItem("Delete", null, (_, _) => DeletePreset());
+        var miDrop = new ToolStripMenuItem("Create drag-and-drop shortcut for this preset", null, (_, _) => CreateDropTarget());
+        more.Items.AddRange(new ToolStripItem[]
+        {
+            miRename, miDelete, new ToolStripSeparator(), miDrop,
+            new ToolStripMenuItem("Open presets folder", null, (_, _) =>
+            {
+                Directory.CreateDirectory(Presets.Dir);
+                Process.Start("explorer.exe", $"\"{Presets.Dir}\"");
+            }),
+        });
+        more.Opening += (_, _) =>
+        {
+            bool user = SelectedUserPreset() != null;
+            miRename.Enabled = miDelete.Enabled = user;
+            miDrop.Enabled = user || SelectedPreset() == Presets.LastRun;
+        };
+        btnMorePreset.Click += (_, _) => more.Show(btnMorePreset, new Point(0, btnMorePreset.Height));
+        btnSavePreset.Click += (_, _) => SavePreset();
+        cbPreset.SelectedIndexChanged += (_, _) =>
+        {
+            UpdatePresetButtons();
+            if (!loadingPresets && SelectedPreset() is { } name) ApplyPreset(name);
+        };
+
+        var bar = Flow(
+            new Label { Text = "Preset", AutoSize = true, Font = new Font("Segoe UI", 10F, FontStyle.Bold), Margin = new Padding(0, 6, 8, 0) },
+            cbPreset, btnSavePreset, Btn("Save as...", (_, _) => SavePresetAs(), 90), btnMorePreset,
+            new Label { Text = "Choosing a preset loads its settings; Run also keeps them as \"Last run\".", AutoSize = true, ForeColor = SystemColors.GrayText, Margin = new Padding(12, 7, 0, 0) });
+        bar.Margin = new Padding(0, 0, 0, 4);
+        return bar;
     }
 
     Control BuildLeft()
@@ -240,7 +297,7 @@ sealed class MainForm : Form
         grid.DataSource = overlays;
 
         var addMenu = new ContextMenuStrip();
-        foreach (var p in Presets)
+        foreach (var p in OverlayPresets)
             addMenu.Items.Add($"{p.Name}   {p.Text}", null, (_, _) => AddOverlay(p.Text, p.Size));
         var tokenMenu = new ContextMenuStrip();
         foreach (var (token, desc) in Template.Tokens)
@@ -293,10 +350,9 @@ sealed class MainForm : Form
         cbCodec.SelectedIndex = (int)settings.Codec;
         cbQuality.SelectedIndex = (int)settings.Quality;
         cbParallel.SelectedIndex = Math.Clamp(settings.ParallelJobs, 0, 4);
-        FillEncoders();
+        FillEncoders(settings.Encoder);
 
-        cbFont.Items.Add(settings.FontName);
-        cbFont.SelectedIndex = 0;
+        SelectFont(settings.FontName);
         chkBold.Checked = settings.Bold;
         cbEdge.SelectedIndex = (int)settings.Edge;
         SetColorButton(btnEdgeColor, edgeColor);
@@ -329,9 +385,9 @@ sealed class MainForm : Form
         return s;
     }
 
-    void FillEncoders()
+    void FillEncoders(string? wanted = null)
     {
-        var wanted = (cbEncoder.SelectedItem as Choice)?.Value ?? settings.Encoder;
+        wanted ??= (cbEncoder.SelectedItem as Choice)?.Value ?? settings.Encoder;
         cbEncoder.Items.Clear();
         if (workers == null)
         {
@@ -443,6 +499,7 @@ sealed class MainForm : Form
     protected override async void OnShown(EventArgs e)
     {
         base.OnShown(e);
+        if (startupWarning != null) Warn(startupWarning);
         setupTask = SetupAsync();
         await setupTask;
     }
@@ -541,8 +598,28 @@ sealed class MainForm : Form
         });
         allFonts = all;
         evenFonts = even;
-        if (!evenFonts.Contains(settings.FontName) && allFonts.Contains(settings.FontName)) chkEven.Checked = false;
-        FillFonts();
+        SelectFont(cbFont.SelectedItem as string ?? settings.FontName);
+    }
+
+    // Selects a font, showing all fonts if it isn't one with even-width digits
+    void SelectFont(string name)
+    {
+        if (allFonts.Count == 0)
+        {
+            // Font list still loading: show just this one for now
+            cbFont.Items.Clear();
+            cbFont.Items.Add(name);
+            cbFont.SelectedIndex = 0;
+            return;
+        }
+        if (!evenFonts.Contains(name) && allFonts.Contains(name) && chkEven.Checked)
+        {
+            cbFont.Items.Clear();   // so the CheckedChanged refill keeps this font, not the old one
+            cbFont.Items.Add(name);
+            cbFont.SelectedIndex = 0;
+            chkEven.Checked = false;
+        }
+        FillFonts(name);
     }
 
     // Fonts whose digits all share one width don't shift as the time ticks over
@@ -557,10 +634,10 @@ sealed class MainForm : Form
         catch { return false; }
     }
 
-    void FillFonts()
+    void FillFonts(string? keep = null)
     {
         if (allFonts.Count == 0) return;
-        var keep = cbFont.SelectedItem as string ?? settings.FontName;
+        keep ??= cbFont.SelectedItem as string ?? settings.FontName;
         cbFont.BeginUpdate();
         cbFont.Items.Clear();
         foreach (var n in chkEven.Checked ? evenFonts : allFonts) cbFont.Items.Add(n);
@@ -661,6 +738,7 @@ sealed class MainForm : Form
     {
         bool idle = !running;
         fileButtons.Enabled = idle;
+        presetBar.Enabled = idle;
         outputPanel.Enabled = idle;
         timePanel.Enabled = idle;
         rightPanel.Enabled = idle;
@@ -803,6 +881,166 @@ sealed class MainForm : Form
         overlays.Insert(to, o);
         grid.CurrentCell = grid.Rows[to].Cells["Text"];
         preview.Invalidate();
+    }
+
+    // --- presets ----------------------------------------------------------------
+
+    string? SelectedPreset() => (cbPreset.SelectedItem as Choice)?.Value;
+
+    string? SelectedUserPreset() => SelectedPreset() is { } n && n != Presets.LastRun && n != Presets.Defaults ? n : null;
+
+    // Refills the list and selects a preset without loading it again
+    void RefreshPresets(string select)
+    {
+        loadingPresets = true;
+        cbPreset.Items.Clear();
+        cbPreset.Items.Add(new Choice("Last run", Presets.LastRun));
+        cbPreset.Items.Add(new Choice("Defaults  (factory settings)", Presets.Defaults));
+        foreach (var n in Presets.Names()) cbPreset.Items.Add(new Choice(n, n));
+        var items = cbPreset.Items.Cast<Choice>().ToList();
+        cbPreset.SelectedIndex = Math.Max(0, items.FindIndex(c => c.Value.Equals(select, StringComparison.OrdinalIgnoreCase)));
+        loadingPresets = false;
+        UpdatePresetButtons();
+    }
+
+    void UpdatePresetButtons() => btnSavePreset.Enabled = SelectedUserPreset() != null;
+
+    void ApplyPreset(string name)
+    {
+        if (Presets.Load(name) is not { } s)
+        {
+            Warn($"The preset \"{name}\" could not be read.");
+            return;
+        }
+        grid.EndEdit();
+        settings = s.Clone();
+        overlays.Clear();
+        foreach (var o in settings.Overlays) overlays.Add(o.Clone());
+        edgeColor = settings.EdgeColor;
+        LoadUi();
+        SetStatus(name switch
+        {
+            Presets.LastRun => "Loaded the last run's settings.",
+            Presets.Defaults => "Loaded the default settings.",
+            _ => $"Loaded preset \"{name}\".",
+        });
+    }
+
+    void SavePreset()
+    {
+        if (SelectedUserPreset() is not { } name) return;
+        grid.EndEdit();
+        Presets.Save(name, CurrentSettings());
+        SetStatus($"Saved preset \"{name}\".");
+    }
+
+    void SavePresetAs()
+    {
+        grid.EndEdit();
+        var name = SelectedUserPreset() ?? "";
+        while (true)
+        {
+            name = Prompt("Save preset", "Name for this preset:", name)?.Trim();
+            if (name == null) return;
+            if (Presets.Problem(name) is { } problem) { Warn(problem); continue; }
+            if (Presets.Exists(name) && MessageBox.Show(this, $"Replace the existing preset \"{name}\"?", "Save preset",
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) continue;
+            break;
+        }
+        Presets.Save(name, CurrentSettings());
+        RefreshPresets(name);
+        SetStatus($"Saved preset \"{name}\".");
+    }
+
+    void RenamePreset()
+    {
+        if (SelectedUserPreset() is not { } from) return;
+        var to = from;
+        while (true)
+        {
+            to = Prompt("Rename preset", $"New name for \"{from}\":", to)?.Trim();
+            if (to == null || to == from) return;
+            if (Presets.Problem(to) is { } problem) { Warn(problem); continue; }
+            if (Presets.Exists(to) && !to.Equals(from, StringComparison.OrdinalIgnoreCase)) { Warn($"There is already a preset called \"{to}\"."); continue; }
+            break;
+        }
+        Presets.Rename(from, to);
+        // Keep its drag-and-drop shortcut working
+        if (File.Exists(DropTargetPath(from)))
+        {
+            try { File.Delete(DropTargetPath(from)); WriteDropTarget(to); } catch { }
+        }
+        RefreshPresets(to);
+        SetStatus($"Renamed preset to \"{to}\".");
+    }
+
+    void DeletePreset()
+    {
+        if (SelectedUserPreset() is not { } name) return;
+        bool hasShortcut = File.Exists(DropTargetPath(name));
+        if (MessageBox.Show(this, $"Delete the preset \"{name}\"?" + (hasShortcut ? "\n\nIts drag-and-drop shortcut will be deleted too." : ""),
+                "Delete preset", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+        Presets.Delete(name);
+        if (hasShortcut) try { File.Delete(DropTargetPath(name)); } catch { }
+        RefreshPresets(Presets.LastRun);
+        SetStatus($"Deleted preset \"{name}\". The current settings are unchanged.");
+    }
+
+    // A .bat next to the exe: dropping videos on it runs them with this preset
+    void CreateDropTarget()
+    {
+        var name = SelectedPreset();
+        if (name == null || name == Presets.Defaults) return;
+        try
+        {
+            var path = WriteDropTarget(name);
+            SetStatus($"Created \"{Path.GetFileName(path)}\" next to the app. Drop videos on it to run this preset.");
+            Process.Start("explorer.exe", $"/select,\"{path}\"");
+        }
+        catch (Exception ex)
+        {
+            Warn("Couldn't create the shortcut next to the app (is it in a protected folder?):\n\n" + ex.Message);
+        }
+    }
+
+    static string DropTargetPath(string name) => Path.Combine(AppContext.BaseDirectory,
+        name == Presets.LastRun ? "Video Timecode - use last settings.bat" : $"Video Timecode - {name}.bat");
+
+    static string WriteDropTarget(string name)
+    {
+        var path = DropTargetPath(name);
+        var args = name == Presets.LastRun ? "--use-saved" : $"--preset \"{name}\"";
+        File.WriteAllText(path,
+            "@echo off\r\n" +
+            $"rem Drop videos on this file to run them with the Video Timecode {(name == Presets.LastRun ? "last run's settings" : $"\"{name}\" preset")}\r\n" +
+            $"start \"\" \"%~dp0VideoTimecode.exe\" {args} %*\r\n");
+        return path;
+    }
+
+    // A minimal text prompt; returns null if cancelled
+    string? Prompt(string title, string label, string value)
+    {
+        using var f = new Form
+        {
+            Text = title, FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterParent,
+            MinimizeBox = false, MaximizeBox = false, ShowInTaskbar = false, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Font = Font, AutoScaleDimensions = new SizeF(96F, 96F), AutoScaleMode = AutoScaleMode.Dpi, Padding = new Padding(12),
+        };
+        var tb = new TextBox { Text = value, Width = 340 };
+        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Width = 90, Height = 28 };
+        var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Width = 90, Height = 28 };
+        var t = new TableLayoutPanel { ColumnCount = 1, AutoSize = true, Dock = DockStyle.Fill };
+        t.Controls.Add(new Label { Text = label, AutoSize = true, Margin = new Padding(3, 3, 3, 6) });
+        t.Controls.Add(tb);
+        var buttons = Flow(ok, cancel);
+        buttons.Anchor = AnchorStyles.Right;
+        buttons.Margin = new Padding(0, 10, 0, 0);
+        t.Controls.Add(buttons);
+        f.Controls.Add(t);
+        f.AcceptButton = ok;
+        f.CancelButton = cancel;
+        f.Shown += (_, _) => tb.SelectAll();
+        return f.ShowDialog(this) == DialogResult.OK ? tb.Text : null;
     }
 
     // --- helpers -----------------------------------------------------------------

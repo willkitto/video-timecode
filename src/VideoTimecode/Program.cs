@@ -2,19 +2,30 @@ namespace VideoTimecode;
 
 static class Program
 {
-    // Usage: VideoTimecode.exe [--use-saved [--exit-when-done]] [video files or folders...]
+    // Usage: VideoTimecode.exe [--use-saved | --preset "Name"] [--exit-when-done] [video files or folders...]
     // Dropping files onto the exe passes them as arguments.
-    //   --use-saved       start straight away with the last saved settings
-    //   --exit-when-done  with --use-saved, close the window when finished (for scripts)
+    //   --use-saved       start straight away with the last run's settings
+    //   --preset "Name"   start straight away with a saved preset
+    //   --exit-when-done  with either of the above, close the window when finished (for scripts)
     [STAThread]
     static void Main(string[] args)
     {
         ApplicationConfiguration.Initialize();
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
         Application.ThreadException += (_, e) => ReportCrash(e.Exception);
-        bool Flag(string name) => args.Any(a => a.Equals(name, StringComparison.OrdinalIgnoreCase));
-        var paths = args.Where(a => !a.StartsWith("--", StringComparison.Ordinal));
-        Application.Run(new MainForm(paths, Flag("--use-saved"), Flag("--exit-when-done")));
+
+        bool useSaved = false, exitWhenDone = false;
+        string? preset = null;
+        var paths = new List<string>();
+        for (int i = 0; i < args.Length; i++)
+        {
+            var a = args[i];
+            if (a.Equals("--use-saved", StringComparison.OrdinalIgnoreCase)) useSaved = true;
+            else if (a.Equals("--exit-when-done", StringComparison.OrdinalIgnoreCase)) exitWhenDone = true;
+            else if (a.Equals("--preset", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) preset = args[++i];
+            else if (!a.StartsWith("--", StringComparison.Ordinal)) paths.Add(a);
+        }
+        Application.Run(new MainForm(paths, useSaved, preset, exitWhenDone));
     }
 
     // Saves the details for bug reports and keeps the app running

@@ -66,19 +66,21 @@ public sealed class AppSettings
 
     public static AppSettings Load()
     {
-        try
-        {
-            if (File.Exists(FilePath))
-                return JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(FilePath), Json) ?? new();
-        }
-        catch { }
-        return ImportLegacy() ?? new();
+        return File.Exists(FilePath) ? LoadFile(FilePath) ?? new() : ImportLegacy() ?? new();
     }
 
-    public void Save()
+    public void Save() => SaveFile(FilePath);
+
+    public static AppSettings? LoadFile(string path)
     {
-        Directory.CreateDirectory(Dir);
-        File.WriteAllText(FilePath, JsonSerializer.Serialize(this, Json));
+        try { return JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(path), Json); }
+        catch { return null; }
+    }
+
+    public void SaveFile(string path)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllText(path, JsonSerializer.Serialize(this, Json));
     }
 
     public AppSettings Clone()
