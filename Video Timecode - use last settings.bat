@@ -1,3 +1,3 @@
 @echo off
-powershell -NoProfile -STA -ExecutionPolicy Bypass -File "%~dp0VideoTimecode.ps1" -UseSaved %*
-pause
+rem Runs Video Timecode straight away with the settings saved from its window
+start "" "%~dp0VideoTimecode.exe" --use-saved %*

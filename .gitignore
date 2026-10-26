@@ -4,3 +4,5 @@ VideoTimecode.settings.json
 ffmpeg.exe
 ffprobe.exe
 dist/
+bin/
+obj/
