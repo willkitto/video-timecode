@@ -245,9 +245,9 @@ sealed class MainForm : Form
         var tokenMenu = new ContextMenuStrip();
         foreach (var (token, desc) in Template.Tokens)
             tokenMenu.Items.Add($"{token}   {desc}", null, (_, _) => InsertToken(token));
-        var btnAdd = new Button { Text = "Add overlay  â–¾", Width = 120, Height = 28 };
+        var btnAdd = new Button { Text = "Add overlay  \u25BE", Width = 120, Height = 28 };
         btnAdd.Click += (_, _) => addMenu.Show(btnAdd, new Point(0, btnAdd.Height));
-        var btnToken = new Button { Text = "Insert token  â–¾", Width = 120, Height = 28 };
+        var btnToken = new Button { Text = "Insert token  \u25BE", Width = 120, Height = 28 };
         btnToken.Click += (_, _) => tokenMenu.Show(btnToken, new Point(0, btnToken.Height));
         var overlayButtons = Flow(btnAdd, btnToken,
             Btn("Remove", (_, _) => RemoveOverlay(), 80),
@@ -382,7 +382,7 @@ sealed class MainForm : Form
             if (e.RowIndex >= 0 && e.RowIndex < overlays.Count && grid.Columns[e.ColumnIndex].Name == "Position")
             {
                 var pos = overlays[e.RowIndex].Position;
-                e.Value = (Positions.FirstOrDefault(p => p.Value == pos)?.Name ?? pos.ToString()) + "  â–¾";
+                e.Value = (Positions.FirstOrDefault(p => p.Value == pos)?.Name ?? pos.ToString()) + "  \u25BE";
                 e.FormattingApplied = true;
             }
             if (e.RowIndex >= 0 && grid.Columns[e.ColumnIndex].Name == "Color" && e.CellStyle != null)
