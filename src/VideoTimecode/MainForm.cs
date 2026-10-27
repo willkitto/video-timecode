@@ -76,6 +76,7 @@ sealed class MainForm : Form
     readonly Label lblStatus = new() { AutoSize = true, Anchor = AnchorStyles.Left, Text = "Starting..." };
     readonly LinkLabel lnkOpen = new() { Text = "Open output folder", AutoSize = true, Visible = false, Anchor = AnchorStyles.Left };
     readonly LinkLabel lnkLog = new() { Text = "Open log", AutoSize = true, Visible = false, Anchor = AnchorStyles.Left };
+    readonly Button btnDiag = new() { Text = "Diagnostics...", AutoSize = true, Height = 32, Anchor = AnchorStyles.Left, Margin = new Padding(3, 3, 12, 3) };
     readonly Button btnRun = new() { Text = "Run", Width = 100, Height = 32 };
     readonly Button btnCancel = new() { Text = "Close", Width = 100, Height = 32 };
     readonly ComboBox cbPreset = Drop(280);
@@ -373,15 +374,16 @@ sealed class MainForm : Form
 
     Control BuildBottom()
     {
-        var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 6, AutoSize = true, Margin = new Padding(0, 8, 0, 0) };
+        var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 7, AutoSize = true, Margin = new Padding(0, 8, 0, 0) };
         t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 55));
         t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 45));
-        for (int i = 0; i < 4; i++) t.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        for (int i = 0; i < 5; i++) t.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         lblStatus.AutoEllipsis = true;
         lblStatus.AutoSize = false;
         lblStatus.Dock = DockStyle.Fill;
         lblStatus.TextAlign = ContentAlignment.MiddleLeft;
-        t.Controls.AddRange(new Control[] { lblStatus, progress, lnkLog, lnkOpen, btnCancel, btnRun });
+        t.Controls.AddRange(new Control[] { lblStatus, progress, lnkLog, lnkOpen, btnDiag, btnCancel, btnRun });
+        tips.SetToolTip(btnDiag, "Why a GPU isn't used: this PC's graphics hardware, FFmpeg, and every encoder test, saved as a report to send");
         return t;
     }
 
@@ -653,6 +655,7 @@ sealed class MainForm : Form
             if (lastOutput != null && File.Exists(lastOutput))
                 Process.Start("explorer.exe", $"/select,\"{lastOutput}\"");
         };
+        btnDiag.Click += (_, _) => ShowDiagnostics();
         lnkLog.LinkClicked += (_, _) =>
         {
             if (File.Exists(logPath)) Process.Start(new ProcessStartInfo(logPath) { UseShellExecute = true });
@@ -708,12 +711,15 @@ sealed class MainForm : Form
         if (quickRun) await RunAsync(fromSetup: true);
     }
 
-    async Task<bool> DownloadFfmpegAsync()
+    async Task<bool> DownloadFfmpegAsync(bool replace = false)
     {
         var answer = MessageBox.Show(this,
-            "Video Timecode uses FFmpeg (free and open source) to read and write video, and it isn't on this PC yet.\n\n" +
-            "Download it now? About 85 MB from github.com/BtbN/FFmpeg-Builds. It is checked against its published " +
-            "checksum and kept in your user profile, so this only happens once.",
+            (replace
+                ? "Download a fresh copy of FFmpeg for this app? It includes the NVIDIA, AMD and Intel encoders, and the app uses it " +
+                  "ahead of any other FFmpeg on this PC.\n\n"
+                : "Video Timecode uses FFmpeg (free and open source) to read and write video, and it isn't on this PC yet.\n\nDownload it now? ") +
+            "About 85 MB from github.com/BtbN/FFmpeg-Builds. It is checked against its published " +
+            "checksum and kept in your user profile" + (replace ? "." : ", so this only happens once."),
             "Download FFmpeg", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
         if (answer != DialogResult.Yes) return false;
 
@@ -741,23 +747,43 @@ sealed class MainForm : Form
         }
     }
 
-    async Task DetectEncodersAsync()
+    async Task DetectEncodersAsync(bool force = false)
     {
         SetStatus("Checking this PC's GPU encoders...");
         try
         {
-            workers = await Task.Run(() => EncoderCaps.DetectAsync(m => UI(() => SetStatus(m)), CancellationToken.None));
+            workers = await Task.Run(() => EncoderCaps.DetectAsync(m => UI(() => SetStatus(m)), CancellationToken.None, force));
         }
         catch (Exception ex)
         {
+            EncoderCaps.LastError = ex.ToString();
             workers = new() { EncoderCaps.Cpu() };
-            SetStatus("GPU check failed, burn-in will use the CPU: " + ex.Message);
+            SetStatus("GPU check failed, burn-in will use the CPU: " + ex.Message + "  (Diagnostics... shows details)");
             RenderEncoders();
             return;
         }
         RenderEncoders();
         var gpus = workers.Where(w => w.Vendor != Vendor.Cpu).Select(w => w.Name).ToList();
-        SetStatus(gpus.Count > 0 ? "Ready.  GPU encoders: " + string.Join(", ", gpus) : "Ready.  No GPU encoder found; burn-in will use the CPU.");
+        var found = workers;
+        var unused = await Task.Run(() => Diagnostics.UnusedGpus(found));
+        SetStatus((gpus.Count > 0 ? "Ready.  GPU encoders: " + string.Join(", ", gpus) : "Ready.  No GPU encoder found; burn-in will use the CPU.") +
+                  (unused.Count > 0 ? $"  Not usable: {string.Join(", ", unused)} - click Diagnostics... for why." : ""));
+    }
+
+    void ShowDiagnostics()
+    {
+        using var f = new DiagnosticsForm(
+            () => workers,
+            CurrentSettings,
+            async () =>
+            {
+                if (!Ffmpeg.Ready && !Ffmpeg.Locate()) return;
+                await DetectEncodersAsync(force: true);
+            },
+            () => DownloadFfmpegAsync(replace: true),
+            () => lvFiles.Items.Count > 0 ? (string)lvFiles.Items[0].Tag! : null,
+            running);
+        f.ShowDialog(this);
     }
 
     async Task LoadFontsAsync()
@@ -875,7 +901,10 @@ sealed class MainForm : Form
             using var log = new StreamWriter(logPath, false) { AutoFlush = true };
             var logLock = new object();
             log.WriteLine($"Video Timecode {typeof(Program).Assembly.GetName().Version} - {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
-            log.WriteLine($"Mode {s.Mode}; encoders: {string.Join(", ", workers.Select(w => $"{w.Name} [{string.Join(' ', w.Caps)}]"))}");
+            log.WriteLine($"FFmpeg {Ffmpeg.FfmpegPath} ({Ffmpeg.Source()})");
+            log.WriteLine($"Mode {s.Mode}; codec {s.Codec}; quality {s.Quality}; ticked encoders: " +
+                          (s.Encoders.Count == 0 ? "automatic" : string.Join(", ", s.Encoders)));
+            foreach (var w in workers) log.WriteLine($"  encoder {w.Id}: {w.Name} [{string.Join(' ', w.Caps)}]");
             var runner = new JobRunner(s, workers, (job, text, f) => UI(() => UpdateJob(job, text, f, jobs)),
                 line => { lock (logLock) log.WriteLine(line); });
             await Task.Run(() => runner.RunAsync(jobs, cts.Token));

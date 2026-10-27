@@ -7,6 +7,8 @@ static class Program
     //   --use-saved       start straight away with the last run's settings
     //   --preset "Name"   start straight away with a saved preset
     //   --exit-when-done  with either of the above, close the window when finished (for scripts)
+    //   --diagnostics     check the GPU encoders, write diagnostics.txt to the settings folder and open it
+    //                     (with a video: also test-encode its first seconds with every encoder)
     [STAThread]
     static void Main(string[] args)
     {
@@ -25,7 +27,39 @@ static class Program
             else if (a.Equals("--preset", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) preset = args[++i];
             else if (!a.StartsWith("--", StringComparison.Ordinal)) paths.Add(a);
         }
+        if (args.Any(a => a.Equals("--diagnostics", StringComparison.OrdinalIgnoreCase)))
+        {
+            WriteDiagnostics(paths.FirstOrDefault());
+            return;
+        }
         Application.Run(new MainForm(paths, useSaved, preset, exitWhenDone));
+    }
+
+    // --diagnostics [video]: checks the encoders afresh (and test-encodes the video, if given),
+    // writes diagnostics.txt to the settings folder and opens it, without the main window
+    static void WriteDiagnostics(string? video)
+    {
+        Task.Run(async () =>
+        {
+            List<Worker>? workers = null;
+            string? trial = null;
+            if (Ffmpeg.Locate())
+            {
+                try { workers = await EncoderCaps.DetectAsync(null, CancellationToken.None, force: true); }
+                catch (Exception e) { EncoderCaps.LastError = e.ToString(); }
+                if (workers != null && video != null)
+                {
+                    var lines = new System.Text.StringBuilder($"Video: {video}\n");
+                    await JobRunner.TrialAsync(video, AppSettings.Load(), workers, l => { lock (lines) lines.AppendLine(l); }, CancellationToken.None);
+                    trial = lines.ToString();
+                }
+            }
+            var report = await Diagnostics.BuildAsync(workers, AppSettings.Load(), trial, CancellationToken.None);
+            Directory.CreateDirectory(AppSettings.Dir);
+            File.WriteAllText(Diagnostics.ReportPath, report.Replace("\r\n", "\n").Replace("\n", "\r\n"));
+        }).GetAwaiter().GetResult();
+        if (Environment.GetEnvironmentVariable("VIDEO_TIMECODE_NO_OPEN") == null)
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(Diagnostics.ReportPath) { UseShellExecute = true });
     }
 
     // Saves the details for bug reports and keeps the app running

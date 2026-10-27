@@ -1,6 +1,7 @@
 using System.Management;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 
 namespace VideoTimecode;
 
@@ -15,11 +16,52 @@ sealed class Worker
     public int GpuIndex { get; set; }
     public int Slots { get; set; } = 1;      // jobs it runs at once
     public List<string> Caps { get; set; } = new();   // "codec|class", e.g. "hevc|420-10"
+    public List<string> DeviceArgs { get; set; } = new();   // picks one of several AMD or Intel GPUs
 
     [JsonIgnore] public int Active;
 
     public bool Supports(string codec, string cls) => Caps.Contains($"{codec}|{cls}");
     public override string ToString() => Name;
+}
+
+// A graphics adapter as FFmpeg's Direct3D 11 sees it (the numbering AMD and Intel GPUs are picked by)
+sealed class Adapter
+{
+    public int Index { get; set; }
+    public string VendorId { get; set; } = "";
+    public string DeviceId { get; set; } = "";
+    public string Name { get; set; } = "";
+    public string Error { get; set; } = "";
+}
+
+// One trial encode made while checking the encoders
+sealed class EncoderTest
+{
+    public string Encoder { get; set; } = "";
+    public string Format { get; set; } = "";
+    public string Device { get; set; } = "";
+    public string Result { get; set; } = "";   // pixel class produced, "" if it failed
+    public int Code { get; set; }
+    public string Error { get; set; } = "";
+    public double Seconds { get; set; }
+}
+
+// What the encoder check found and why, for the diagnostics report
+sealed class Detection
+{
+    public DateTime When { get; set; }
+    public string FfmpegPath { get; set; } = "";
+    public List<string> BuiltEncoders { get; set; } = new();
+    public List<Adapter> Adapters { get; set; } = new();
+    public List<string> NvencGpus { get; set; } = new();
+    public List<EncoderTest> Tests { get; set; } = new();
+    [JsonIgnore] public bool FromCache;
+}
+
+// A graphics adapter as Windows lists it
+sealed record GpuInfo(string Name, string VendorId, string DriverVersion, string DriverDate, string PnpId, int ErrorCode, string Status, long RamMB)
+{
+    public Vendor? Vendor => EncoderCaps.VendorOf(VendorId);
 }
 
 static class EncoderCaps
@@ -33,8 +75,13 @@ static class EncoderCaps
     static readonly string[] Codecs = { "h264", "hevc", "av1" };
     static readonly (string Cls, string Fmt)[] TestFormats =
         { ("420-8", "yuv420p"), ("420-10", "yuv420p10le"), ("422-8", "yuv422p"), ("422-10", "yuv422p10le") };
+    static readonly string[] CpuEncoders = { "libx264", "libx265", "libsvtav1", "prores_ks" };
 
     static string CachePath => Path.Combine(AppSettings.Dir, "encoders.json");
+
+    // The last check's details, and the error if it crashed
+    public static Detection? Last { get; private set; }
+    public static string? LastError { get; set; }
 
     public static Worker Cpu() => new()
     {
@@ -48,114 +95,245 @@ static class EncoderCaps
 
     // Finds every working hardware encoder on this PC by trying a tiny encode with each,
     // then checking the format that actually came out (ffmpeg would otherwise quietly
-    // convert, e.g. 10-bit down to 8-bit). Results are cached until the GPUs or ffmpeg change.
-    public static async Task<List<Worker>> DetectAsync(Action<string>? status, CancellationToken ct)
+    // convert, e.g. 10-bit down to 8-bit). Results are cached until the GPUs, their drivers
+    // or ffmpeg change; force skips the cache. Every test is kept for the diagnostics report.
+    public static async Task<List<Worker>> DetectAsync(Action<string>? status, CancellationToken ct, bool force = false)
     {
-        var gpus = GpuNames();
+        var gpus = Gpus();
         var ff = new FileInfo(Ffmpeg.FfmpegPath!);
-        var key = $"2|{ff.FullName}|{ff.Length}|{ff.LastWriteTimeUtc.Ticks}|{string.Join(";", gpus)}";
+        var key = $"3|{ff.FullName}|{ff.Length}|{ff.LastWriteTimeUtc.Ticks}|" +
+                  string.Join(";", gpus.Select(g => $"{g.PnpId}|{g.DriverVersion}|{g.ErrorCode}"));
+        LastError = null;
         try
         {
-            if (File.Exists(CachePath))
+            if (!force && File.Exists(CachePath))
             {
                 var cached = JsonSerializer.Deserialize<Cache>(File.ReadAllText(CachePath), Json);
-                if (cached?.Key == key && cached.Workers.Count > 0) return cached.Workers;
+                if (cached?.Key == key && cached.Workers.Count > 0)
+                {
+                    Last = cached.Detection;
+                    if (Last != null) Last.FromCache = true;
+                    return cached.Workers;
+                }
             }
         }
         catch { }
 
         status?.Invoke("Testing GPU encoders on this PC...");
-        var workers = new List<Worker>();
+        var d = new Detection { When = DateTime.Now, FfmpegPath = ff.FullName };
         using var gate = new SemaphoreSlim(6);
+        d.BuiltEncoders = await BuiltEncodersAsync(ct);
+        d.Adapters = await AdaptersAsync(gate, ct);
+
+        var workers = new List<Worker>();
         foreach (var hw in Hardware)
         {
-            string[] gpu0 = hw.Vendor == Vendor.Nvidia ? new[] { "-gpu", "0" } : Array.Empty<string>();
-            var present = await Task.WhenAll(
-                TestAsync($"h264_{hw.Suffix}", "yuv420p", gpu0, gate, ct),
-                TestAsync($"hevc_{hw.Suffix}", "yuv420p", gpu0, gate, ct));
-            if (present.All(p => p == null)) continue;
-            string probeCodec = present[0] != null ? "h264" : "hevc";
-
-            var tests = (from codec in Codecs from f in TestFormats select (codec, f.Cls, f.Fmt)).ToList();
-            var results = await Task.WhenAll(tests.Select(t => TestAsync($"{t.codec}_{hw.Suffix}", t.Fmt, gpu0, gate, ct)));
-            var caps = tests.Where((t, i) => results[i] == t.Cls).Select(t => $"{t.codec}|{t.Cls}").ToList();
-            if (caps.Count == 0) continue;
-
-            // NVENC can address each NVIDIA GPU separately
-            var indices = new List<int> { 0 };
-            if (hw.Vendor == Vendor.Nvidia)
-                for (int i = 1; i < 8; i++)
-                {
-                    if (await TestAsync($"{probeCodec}_nvenc", "yuv420p", new[] { "-gpu", i.ToString() }, gate, ct) == null) break;
-                    indices.Add(i);
-                }
-
-            var names = gpus.Where(n => Matches(hw.Vendor, n)).ToList();
-            foreach (var i in indices)
+            if (!d.BuiltEncoders.Any(e => e.EndsWith("_" + hw.Suffix, StringComparison.Ordinal)))
             {
-                var gpuName = i < names.Count ? names[i] : $"{hw.Vendor} GPU {i}";
+                d.Tests.Add(new EncoderTest { Encoder = $"*_{hw.Suffix}", Code = -1, Error = "Not included in this FFmpeg build." });
+                continue;
+            }
+
+            // The GPUs to try: NVENC numbers NVIDIA GPUs itself; AMD and Intel GPUs are picked
+            // by adapter, but only when there are several (with one, the default needs no picking)
+            var devices = new List<(int Index, string Name, string[] Args, string Label)>();
+            if (hw.Vendor == Vendor.Nvidia)
+            {
+                d.NvencGpus = await NvencGpusAsync(d.BuiltEncoders, ct);
+                var names = gpus.Where(g => g.Vendor == Vendor.Nvidia).Select(g => g.Name).ToList();
+                for (int i = 0; i < Math.Max(1, d.NvencGpus.Count); i++)
+                    devices.Add((i, i < d.NvencGpus.Count ? d.NvencGpus[i] : i < names.Count ? names[i] : $"NVIDIA GPU {i}",
+                        new[] { "-gpu", i.ToString() }, $"-gpu {i}"));
+            }
+            else
+            {
+                var ads = d.Adapters.Where(a => VendorOf(a.VendorId) == hw.Vendor).ToList();
+                if (ads.Count > 1)
+                    foreach (var a in ads) devices.Add((a.Index, a.Name, DeviceArgs(hw.Vendor, a.Index), $"adapter {a.Index}"));
+                else
+                    devices.Add((ads.FirstOrDefault()?.Index ?? 0,
+                        ads.FirstOrDefault()?.Name ?? gpus.FirstOrDefault(g => g.Vendor == hw.Vendor)?.Name ?? $"{hw.Vendor} GPU",
+                        Array.Empty<string>(), "default"));
+            }
+
+            foreach (var dev in devices)
+            {
+                var present = await Task.WhenAll(
+                    TestAsync(d, $"h264_{hw.Suffix}", "yuv420p", dev.Args, dev.Label, gate, ct),
+                    TestAsync(d, $"hevc_{hw.Suffix}", "yuv420p", dev.Args, dev.Label, gate, ct));
+                if (present.All(p => p == null)) continue;
+
+                var tests = (from codec in Codecs from f in TestFormats select (codec, f.Cls, f.Fmt)).ToList();
+                var results = await Task.WhenAll(tests.Select(t =>
+                    t.Cls == "420-8" && t.codec == "h264" ? Task.FromResult(present[0]) :
+                    t.Cls == "420-8" && t.codec == "hevc" ? Task.FromResult(present[1]) :
+                    TestAsync(d, $"{t.codec}_{hw.Suffix}", t.Fmt, dev.Args, dev.Label, gate, ct)));
+                var caps = tests.Where((t, i) => results[i] == t.Cls).Select(t => $"{t.codec}|{t.Cls}").ToList();
+                if (caps.Count == 0) continue;
+
                 workers.Add(new Worker
                 {
-                    Id = hw.Vendor == Vendor.Nvidia ? $"nvenc:{i}" : hw.Suffix,
-                    Name = $"{gpuName} ({hw.Label})",
+                    Id = hw.Vendor == Vendor.Nvidia ? $"nvenc:{dev.Index}" : dev.Args.Length > 0 ? $"{hw.Suffix}:{dev.Index}" : hw.Suffix,
+                    Name = $"{dev.Name} ({hw.Label})",
                     Vendor = hw.Vendor,
-                    GpuIndex = i,
+                    GpuIndex = dev.Index,
                     Slots = hw.Slots,
                     Caps = caps,
+                    DeviceArgs = hw.Vendor == Vendor.Nvidia ? new() : dev.Args.ToList(),
                 });
             }
         }
-        workers.Add(Cpu());
 
+        // The CPU only claims what this FFmpeg build can actually encode
+        var cpu = Cpu();
+        if (d.BuiltEncoders.Count > 0)
+            cpu.Caps = cpu.Caps.Where(c => d.BuiltEncoders.Contains(EncodePlan.EncoderName(c.Split('|')[0], cpu))).ToList();
+        workers.Add(cpu);
+
+        Last = d;
         try
         {
             Directory.CreateDirectory(AppSettings.Dir);
-            File.WriteAllText(CachePath, JsonSerializer.Serialize(new Cache { Key = key, Workers = workers }, Json));
+            File.WriteAllText(CachePath, JsonSerializer.Serialize(new Cache { Key = key, Workers = workers, Detection = d }, Json));
         }
         catch { }
         return workers;
     }
 
+    // Arguments that open one particular AMD or Intel GPU (adapter numbers as Direct3D 11 counts them).
+    // The encoders pick the device up by its type.
+    static string[] DeviceArgs(Vendor v, int adapter) => v == Vendor.Intel
+        ? new[] { "-init_hw_device", $"d3d11va=vtcd:{adapter}", "-init_hw_device", "qsv=vtc@vtcd" }
+        : new[] { "-init_hw_device", $"d3d11va=vtcd:{adapter}" };
+
     // Returns the pixel-format class the encoder actually produced, or null if it failed
-    static async Task<string?> TestAsync(string encoder, string fmt, string[] extra, SemaphoreSlim gate, CancellationToken ct)
+    static async Task<string?> TestAsync(Detection d, string encoder, string fmt, string[] device, string label, SemaphoreSlim gate, CancellationToken ct)
     {
         await gate.WaitAsync(ct);
         var tmp = Path.Combine(Path.GetTempPath(), $"vtc_cap_{Guid.NewGuid():N}.mkv");
+        var test = new EncoderTest { Encoder = encoder, Format = fmt, Device = label };
+        var sw = System.Diagnostics.Stopwatch.StartNew();
         try
         {
-            var args = new List<string> { "-v", "error", "-y", "-f", "lavfi", "-i", $"testsrc2=s=640x360:r=30:d=0.5,format={fmt}", "-frames:v", "5" };
-            args.AddRange(extra);
+            bool global = device.Length > 0 && device[0] == "-init_hw_device";
+            var args = new List<string> { "-hide_banner", "-v", "error", "-y" };
+            if (global) args.AddRange(device);
+            args.AddRange(new[] { "-f", "lavfi", "-i", $"testsrc2=s=640x360:r=30:d=0.5,format={fmt}", "-frames:v", "5" });
+            if (!global) args.AddRange(device);
             args.AddRange(new[] { "-c:v", encoder, tmp });
-            var r = await Ffmpeg.RunAsync(Ffmpeg.FfmpegPath!, args, ct, TimeSpan.FromSeconds(20));
-            if (r.Code != 0 || !File.Exists(tmp)) return null;
+            // Generous timeout: a laptop's GPU can take a while to wake up
+            var r = await Ffmpeg.RunAsync(Ffmpeg.FfmpegPath!, args, ct, TimeSpan.FromSeconds(30));
+            test.Code = r.Code;
+            if (r.Code != 0 || !File.Exists(tmp))
+            {
+                test.Error = Ffmpeg.Brief(r.Stderr, 4);
+                return null;
+            }
             var p = await Ffmpeg.RunAsync(Ffmpeg.FfprobePath!,
                 new[] { "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=pix_fmt", "-of", "csv=p=0", tmp }, ct, TimeSpan.FromSeconds(20));
-            return Pix.ClassOf(p.Stdout.Trim().TrimEnd(','));
+            var pixFmt = p.Stdout.Trim().TrimEnd(',');
+            test.Result = Pix.ClassOf(pixFmt);
+            if (test.Result != Pix.ClassOf(fmt)) test.Error = $"Came out as {pixFmt}, not {fmt}.";
+            return test.Result;
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            test.Code = -1;
+            test.Error = e.Message;
+            return null;
         }
         finally
         {
+            test.Seconds = sw.Elapsed.TotalSeconds;
+            lock (d.Tests) d.Tests.Add(test);
             gate.Release();
             try { File.Delete(tmp); } catch { }
         }
     }
 
-    static List<string> GpuNames()
+    // The hardware encoders, and the CPU encoders the app uses, that this FFmpeg build includes
+    static async Task<List<string>> BuiltEncodersAsync(CancellationToken ct)
+    {
+        var r = await Ffmpeg.RunAsync(Ffmpeg.FfmpegPath!, new[] { "-hide_banner", "-encoders" }, ct, TimeSpan.FromSeconds(20));
+        return r.Stdout.Split('\n')
+            .Select(l => Regex.Match(l, @"^\s*V\S{5}\s+(\S+)"))
+            .Where(m => m.Success).Select(m => m.Groups[1].Value)
+            .Where(n => n.EndsWith("_nvenc") || n.EndsWith("_amf") || n.EndsWith("_qsv") || CpuEncoders.Contains(n))
+            .ToList();
+    }
+
+    // The adapters FFmpeg can open, numbered as it numbers them
+    static async Task<List<Adapter>> AdaptersAsync(SemaphoreSlim gate, CancellationToken ct)
+    {
+        var found = await Task.WhenAll(Enumerable.Range(0, 6).Select(async i =>
+        {
+            await gate.WaitAsync(ct);
+            try
+            {
+                var r = await Ffmpeg.RunAsync(Ffmpeg.FfmpegPath!, new[] { "-hide_banner", "-v", "verbose", "-init_hw_device", $"d3d11va=d:{i}",
+                    "-f", "lavfi", "-i", "nullsrc=s=64x64", "-frames:v", "1", "-f", "null", "-" }, ct, TimeSpan.FromSeconds(20));
+                var m = Regex.Match(r.Stderr, @"Using device ([0-9a-fA-F]{4}):([0-9a-fA-F]{4}) \((.*)\)\.");
+                if (!m.Success) return null;
+                return new Adapter
+                {
+                    Index = i,
+                    VendorId = m.Groups[1].Value.ToLowerInvariant(),
+                    DeviceId = m.Groups[2].Value.ToLowerInvariant(),
+                    Name = m.Groups[3].Value.Trim(),
+                    Error = r.Code == 0 ? "" : Ffmpeg.Brief(r.Stderr, 2),
+                };
+            }
+            finally { gate.Release(); }
+        }));
+        // Numbers run without gaps, so stop at the first that doesn't exist. Windows' software
+        // renderer (vendor 1414) comes last and can't encode.
+        return found.TakeWhile(a => a != null).Select(a => a!).Where(a => a.VendorId != "1414").ToList();
+    }
+
+    // NVENC's own numbering of NVIDIA GPUs (what -gpu N picks)
+    static async Task<List<string>> NvencGpusAsync(List<string> built, CancellationToken ct)
+    {
+        var enc = built.FirstOrDefault(e => e.EndsWith("_nvenc", StringComparison.Ordinal));
+        if (enc == null) return new();
+        var r = await Ffmpeg.RunAsync(Ffmpeg.FfmpegPath!, new[] { "-hide_banner", "-f", "lavfi", "-i", "nullsrc=s=64x64",
+            "-frames:v", "1", "-c:v", enc, "-gpu", "list", "-f", "null", "-" }, ct, TimeSpan.FromSeconds(30));
+        return Regex.Matches(r.Stderr, @"GPU #(\d+) - < (.+?) >")
+            .OrderBy(m => int.Parse(m.Groups[1].Value)).Select(m => m.Groups[2].Value.Trim()).ToList();
+    }
+
+    public static Vendor? VendorOf(string vendorId) => vendorId.ToLowerInvariant() switch
+    {
+        "10de" => Vendor.Nvidia,
+        "1002" or "1022" => Vendor.Amd,
+        "8086" => Vendor.Intel,
+        _ => null,
+    };
+
+    // Graphics adapters as Windows lists them, including disabled ones and ones without a driver
+    public static List<GpuInfo> Gpus()
     {
         try
         {
-            using var q = new ManagementObjectSearcher("SELECT Name FROM Win32_VideoController");
-            return q.Get().Cast<ManagementObject>().Select(m => m["Name"] as string).OfType<string>().ToList();
+            using var q = new ManagementObjectSearcher(
+                "SELECT Name, PNPDeviceID, DriverVersion, DriverDate, ConfigManagerErrorCode, Status, AdapterRAM FROM Win32_VideoController");
+            return q.Get().Cast<ManagementObject>().Select(m =>
+            {
+                var pnp = m["PNPDeviceID"] as string ?? "";
+                var ven = Regex.Match(pnp, @"VEN_([0-9A-Fa-f]{4})");
+                var date = m["DriverDate"] as string ?? "";
+                return new GpuInfo(
+                    m["Name"] as string ?? "(no name)",
+                    ven.Success ? ven.Groups[1].Value.ToLowerInvariant() : "",
+                    m["DriverVersion"] as string ?? "",
+                    date.Length >= 8 ? $"{date[..4]}-{date[4..6]}-{date[6..8]}" : "",
+                    pnp,
+                    m["ConfigManagerErrorCode"] is uint e ? (int)e : 0,
+                    m["Status"] as string ?? "",
+                    m["AdapterRAM"] is uint ram ? ram / 1048576 : 0);
+            }).ToList();
         }
         catch { return new(); }
     }
-
-    static bool Matches(Vendor v, string gpuName) => v switch
-    {
-        Vendor.Nvidia => gpuName.Contains("NVIDIA", StringComparison.OrdinalIgnoreCase),
-        Vendor.Intel => gpuName.Contains("Intel", StringComparison.OrdinalIgnoreCase),
-        Vendor.Amd => gpuName.Contains("AMD", StringComparison.OrdinalIgnoreCase) || gpuName.Contains("Radeon", StringComparison.OrdinalIgnoreCase),
-        _ => false,
-    };
 
     static readonly JsonSerializerOptions Json = new() { WriteIndented = true, Converters = { new JsonStringEnumConverter() } };
 
@@ -163,6 +341,7 @@ static class EncoderCaps
     {
         public string Key { get; set; } = "";
         public List<Worker> Workers { get; set; } = new();
+        public Detection? Detection { get; set; }
     }
 }
 
@@ -204,6 +383,9 @@ static class EncodePlan
     {
         // Hardware decoding where possible; ffmpeg falls back to software for formats the GPU can't decode
         Vendor.Nvidia => new() { "-hwaccel", "cuda", "-hwaccel_device", w.GpuIndex.ToString() },
+        // One of several AMD or Intel GPUs: open that one, decode on it, and the encoder uses it too
+        Vendor.Intel or Vendor.Amd when w.DeviceArgs.Count > 0 =>
+            w.DeviceArgs.Concat(new[] { "-hwaccel", "d3d11va", "-hwaccel_device", "vtcd" }).ToList(),
         Vendor.Intel or Vendor.Amd => new() { "-hwaccel", "d3d11va" },
         _ => new(),
     };

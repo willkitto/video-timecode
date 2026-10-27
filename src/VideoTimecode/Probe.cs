@@ -208,6 +208,5 @@ static class Probe
     }
 
     // ffmpeg's most useful message is usually its last one
-    public static string ErrorLine(string s) =>
-        s.Split('\n').Select(l => l.Trim()).LastOrDefault(l => l.Length > 0) ?? "unknown error";
+    public static string ErrorLine(string s) => Ffmpeg.Brief(s, 1);
 }

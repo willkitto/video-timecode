@@ -99,6 +99,38 @@ static class Ffmpeg
         return new RunResult(p.ExitCode, stdout.ToString(), stderr.ToString());
     }
 
+    // Follow-on lines ffmpeg prints after the real error, which say nothing about the cause
+    static readonly Regex Generic = new(
+        @"Error while opening encoder|Task finished with error|Terminating thread with return code|Could not open encoder before EOF|" +
+        @"Nothing was written into output file|Error sending frames to consumers|Conversion failed|Error while filtering|" +
+        @"Error marking filters as finished|Error closing file|^Exiting normally",
+        RegexOptions.IgnoreCase);
+
+    // The first lines of ffmpeg's error output that explain the failure, without the
+    // memory addresses in its "[h264_amf @ 000001c5...]" prefixes
+    public static string Brief(string stderr, int maxLines = 2)
+    {
+        var lines = stderr.Split('\n').Select(l => Regex.Replace(l.Trim(), @" @ [0-9a-fA-Fx]+\]", "]")).Where(l => l.Length > 0).ToList();
+        var useful = lines.Where(l => !Generic.IsMatch(l)).Take(maxLines).ToList();
+        if (useful.Count == 0) useful = lines.TakeLast(1).ToList();
+        return useful.Count == 0 ? "unknown error" : string.Join(" | ", useful);
+    }
+
+    // Where the ffmpeg in use came from
+    public static string Source()
+    {
+        if (FfmpegPath == null) return "not found";
+        var dir = Path.GetDirectoryName(Path.GetFullPath(FfmpegPath))!.TrimEnd('\\');
+        if (dir.Equals(Path.Combine(ToolsDir, "bin"), StringComparison.OrdinalIgnoreCase)) return "downloaded by this app";
+        if (dir.StartsWith(AppContext.BaseDirectory.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase)) return "next to this app";
+        return "found on the PATH (installed separately)";
+    }
+
+    // Every ffmpeg.exe this app could find, in the order it looks (the first one is used)
+    public static List<string> AllCandidates() => CandidateDirs()
+        .Select(d => { try { return Path.GetFullPath(Path.Combine(d, "ffmpeg.exe")); } catch { return null; } })
+        .OfType<string>().Where(File.Exists).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
     // --- first-run download -------------------------------------------------
 
     const string BuildsApi = "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest";

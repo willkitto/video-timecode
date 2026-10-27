@@ -118,6 +118,13 @@ sealed class JobRunner
         {
             (job.Codec, job.Cls) = EncodePlan.Target(info, s, workers);
             report(job, $"Waiting ({Template.CodecName(job.Codec)}, {Pix.Describe(job.Cls)})", 0);
+            // Which encoders could take it, and which are ruled out, so the log shows why one was used
+            var chosen = Chosen();
+            string Names(IEnumerable<Worker> ws) => ws.Any() ? string.Join(", ", ws.Select(w => w.Name)) : "none";
+            log($"  target {Template.CodecName(job.Codec)} {Pix.Describe(job.Cls)}; " +
+                $"can encode it: {Names(workers.Where(w => w.Supports(job.Codec, job.Cls)))}; " +
+                $"can't: {Names(workers.Where(w => !w.Supports(job.Codec, job.Cls)))}; " +
+                $"ticked: {(chosen == null ? "automatic (GPUs first)" : Names(workers.Where(w => chosen.Contains(w.Id))))}");
         }
         else report(job, "Waiting", 0);
     }
@@ -173,6 +180,7 @@ sealed class JobRunner
                 {
                     if (worker != null && CanRetry(j, worker))
                     {
+                        log($"{j.Input}\n  retrying: failed on {worker.Name}" + (j.ForceMkv ? "; trying an .mkv output" : ""));
                         report(j, "Retrying...", 0);
                         pending.Insert(0, j);
                     }
@@ -236,11 +244,18 @@ sealed class JobRunner
 
     async Task<bool> BurnAsync(Job job, Worker w, CancellationToken ct)
     {
-        var v = job.Info!;
         string ext = OutputExtension(job);
-        bool mp4Family = ext is ".mp4" or ".mov";
         job.Output = Reserve(Path.Combine(Path.GetDirectoryName(job.Input)!, Path.GetFileNameWithoutExtension(job.Input) + "_timecode_burned" + ext));
+        var a = BurnArgs(job, w, job.Output, ext, null);
+        var label = w.Vendor == Vendor.Cpu ? "CPU" : w.Name;
+        return await RunFfmpegAsync(job, a, $"{EncodePlan.EncoderName(job.Codec, w)} on {label}", ct);
+    }
 
+    // The ffmpeg arguments that burn a job with an encoder; seconds limits it to the start (for tests)
+    List<string> BurnArgs(Job job, Worker w, string output, string ext, double? seconds)
+    {
+        var v = job.Info!;
+        bool mp4Family = ext is ".mp4" or ".mov";
         // -n: never overwrite, even if a file appeared since the name was chosen
         var a = new List<string> { "-hide_banner", "-nostdin", "-n", "-loglevel", "error" };
         a.AddRange(EncodePlan.DecodeArgs(w));
@@ -260,10 +275,57 @@ sealed class JobRunner
             a.AddRange(new[] { "-movflags", "+faststart+use_metadata_tags" });
             if (v.Timecode != null) a.AddRange(new[] { "-timecode", v.Timecode });
         }
-        a.AddRange(new[] { "-max_muxing_queue_size", "4096", "-progress", "pipe:1", "-nostats", job.Output });
+        if (seconds is { } t) a.AddRange(new[] { "-t", t.ToString(CultureInfo.InvariantCulture) });
+        a.AddRange(new[] { "-max_muxing_queue_size", "4096", "-progress", "pipe:1", "-nostats", output });
+        return a;
+    }
 
-        var label = w.Vendor == Vendor.Cpu ? "CPU" : w.Name;
-        return await RunFfmpegAsync(job, a, $"{EncodePlan.EncoderName(job.Codec, w)} on {label}", ct);
+    // Diagnostics: burns the first seconds of a video with every encoder in turn, with the
+    // current settings, and reports which work, how fast, and what actually came out
+    public static async Task TrialAsync(string video, AppSettings settings, IReadOnlyList<Worker> workers, Action<string> line, CancellationToken ct)
+    {
+        var s = settings.Clone();
+        s.Mode = OutputMode.Burn;
+        var runner = new JobRunner(s, workers, (_, _, _) => { }, line);
+        var job = new Job(video, new object());
+        try
+        {
+            await runner.PrepareAsync(job, ct);
+            var v = job.Info!;
+            double seconds = Math.Min(3, Math.Max(0.1, v.Duration));
+            var ext = runner.OutputExtension(job);
+            for (int i = 0; i < workers.Count; i++)
+            {
+                var w = workers[i];
+                var enc = EncodePlan.EncoderName(job.Codec, w);
+                if (!w.Supports(job.Codec, job.Cls))
+                {
+                    line($"  SKIP {w.Name}: its check found it can't make {Template.CodecName(job.Codec)} {Pix.Describe(job.Cls)}");
+                    continue;
+                }
+                var output = Path.Combine(job.TempDir!, $"trial{i}{ext}");
+                var args = runner.BurnArgs(job, w, output, ext, seconds);
+                line($"  {w.Name}: ffmpeg " + string.Join(' ', args.Select(x => x.Contains(' ') ? $"\"{x}\"" : x)));
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var r = await Ffmpeg.RunAsync(Ffmpeg.FfmpegPath!, args, ct, TimeSpan.FromMinutes(3), job.TempDir, lowPriority: true);
+                if (r.Code != 0 || !File.Exists(output))
+                {
+                    line($"  FAIL {w.Name} ({enc}), exit code {r.Code}: {Ffmpeg.Brief(r.Stderr, 4)}");
+                    continue;
+                }
+                var p = await Ffmpeg.RunAsync(Ffmpeg.FfprobePath!, new[] { "-v", "error", "-select_streams", "v:0",
+                    "-show_entries", "stream=codec_name,pix_fmt,width,height", "-of", "csv=p=0", output }, ct, TimeSpan.FromSeconds(20));
+                line($"  OK   {w.Name} ({enc}): {seconds:0.#} s of video in {sw.Elapsed.TotalSeconds:0.0} s " +
+                     $"({seconds / Math.Max(0.01, sw.Elapsed.TotalSeconds):0.0}x real time); came out as {p.Stdout.Split('\n').Select(l => l.Trim()).FirstOrDefault(l => l != "")}");
+                try { File.Delete(output); } catch { }
+            }
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception e) { line("  FAILED: " + e.Message); }
+        finally
+        {
+            if (job.TempDir != null) try { Directory.Delete(job.TempDir, true); } catch { }
+        }
     }
 
     // Pictures are scaled and placed first (still images repeat their only frame for the whole

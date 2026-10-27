@@ -93,8 +93,9 @@ Everything lives in `%LOCALAPPDATA%\VideoTimecode` (for example
 |---|---|
 | `settings.json` | Last run's settings, written each time you click Run |
 | `presets\<name>.json` | One file per preset. Copy these to another PC to share presets. |
-| `encoders.json` | Which GPU encoders this PC has (re-checked when the GPUs or FFmpeg change) |
+| `encoders.json` | Which GPU encoders this PC has, with every test result (re-checked when the GPUs, their drivers or FFmpeg change) |
 | `last-run.log`, `error.log` | Details of the last run, and of any unexpected errors |
+| `diagnostics.txt` | The last report from **Diagnostics...**, to send when asking for help |
 | `ffmpeg\` | FFmpeg, if the app downloaded it |
 
 ## Date and time format
@@ -188,6 +189,31 @@ without support for it), the file is marked as failed, with a suggestion to tick
 encoder, instead of quietly using one you didn't pick. *Parallel jobs* sets how many videos
 run at once.
 
+PCs with two AMD or two Intel GPUs (for example a Ryzen laptop's built-in Radeon plus a
+discrete Radeon) get one entry per GPU, each tested and used separately.
+
+### When a GPU is missing: Diagnostics
+
+Click **Diagnostics...** at the bottom of the window. It explains, in plain words, why each
+graphics card can or can't be used, and saves everything to `diagnostics.txt` (in the
+settings folder) to send along with a question:
+
+- the graphics cards Windows lists, with driver versions and any Device Manager problem;
+- which FFmpeg is in use, where it came from, and whether it was built with NVIDIA, AMD and Intel support;
+- every encoder test, with FFmpeg's own error message (for example *driver too old*, or *amfrt64.dll missing*);
+- the last run's log, which shows which encoder each video used and why.
+
+The buttons there:
+
+- **Re-check GPUs** runs the encoder tests again (do this after updating a driver).
+- **Test encoders on a video...** burns the first 3 seconds of a video (the first in the list, or one you choose) with every encoder, using your current settings, and reports which work and how fast. Nothing is written next to the video.
+- **Re-download FFmpeg** gets the app's own FFmpeg, which includes every GPU encoder and is used ahead of any other FFmpeg on the PC.
+
+Common causes: an NVIDIA driver too old for the FFmpeg build (update it), an AMD driver
+installed by Windows Update without AMD's encoder runtime (install Adrenalin from amd.com),
+an NVIDIA GeForce MX laptop GPU (it has no video encoder), or a separately installed FFmpeg
+without GPU support.
+
 ## Where the time comes from
 
 The app uses the first of these it finds:
@@ -219,12 +245,14 @@ VideoTimecode.exe [--use-saved | --preset "Name"] [--exit-when-done] [files or f
 - `--use-saved` starts straight away with the last run's settings.
 - `--preset "Name"` starts straight away with a saved preset.
 - `--exit-when-done` closes the window when finished (with either option above), which is handy in scripts.
+- `--diagnostics [video]` checks the encoders afresh, writes `diagnostics.txt` and opens it, without the main window. With a video, it also test-encodes its first seconds with every encoder.
 - The `VIDEO_TIMECODE_HOME` environment variable moves settings, logs and FFmpeg to another folder (e.g. for a portable setup).
 
 ## Troubleshooting
 
 - **SmartScreen warns about the exe or `.bat`.** The app isn't code-signed. Choose *More info → Run anyway*, or right-click the zip → *Properties* → *Unblock* before extracting.
 - **A video failed.** Click **Open log** at the bottom of the window. It lists the exact ffmpeg command and error for each file.
+- **A GPU isn't listed, or isn't used.** Click **Diagnostics...** (see [When a GPU is missing](#when-a-gpu-is-missing-diagnostics)) and send the `diagnostics.txt` it saves.
 - **"No recording date found".** Some formats (e.g. `.mpg`) don't store one.
 - **Timecode is an hour off.** Check the *Time zone* setting, and that the camera clock was set correctly.
 
