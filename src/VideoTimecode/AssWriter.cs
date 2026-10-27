@@ -24,8 +24,10 @@ static class AssWriter
         public double Outline => Math.Max(1, Math.Round(Px / 14));
     }
 
-    public static void Write(string path, TemplateContext c)
+    // Returns where any picture rows go (they take part in the layout but are drawn by ffmpeg)
+    public static List<ImagePlacement> Write(string path, TemplateContext c, bool includeImages)
     {
+        var images = new List<ImagePlacement>();
         var s = c.Settings;
         var v = c.Info;
         int w = Math.Max(2, v.Width), h = Math.Max(2, v.Height);
@@ -51,7 +53,11 @@ static class AssWriter
         long endCs = (long)Math.Floor(c.ClipLength * 100);
         var samples = SampleFrames(n);
 
-        foreach (var g in s.Overlays.Where(o => o.Enabled && !string.IsNullOrWhiteSpace(o.Text)).GroupBy(o => o.Position))
+        bool Shown(Overlay o) => o.Enabled && (o.IsImage
+            ? includeImages && OverlayImages.SizeOf(o.ImagePath!) != null
+            : !string.IsNullOrWhiteSpace(o.Text));
+
+        foreach (var g in s.Overlays.Where(Shown).GroupBy(o => o.Position))
         {
             var align = s.Alignments.GetValueOrDefault(g.Key);
             var rows = g.Select(o => Row.From(o, s, h)).ToList();
@@ -59,6 +65,7 @@ static class AssWriter
             // Size each row from a spread of frames, so the layout holds for the whole clip
             var sizes = rows.Select(r =>
             {
+                if (OverlayImages.Scaled(r.O, h) is { } img) return new RowSize(img.H, 1, 0, img.W);
                 var texts = samples.Select(i => r.Template.Render(c, i, Rel(i))).ToList();
                 int lines = texts.Max(t => t.Count(ch => ch == '\n') + 1);
                 double width = align == RowAlign.Auto ? 0
@@ -71,6 +78,13 @@ static class AssWriter
             {
                 var r = rows[k];
                 var p = places[k];
+                if (r.O.IsImage)
+                {
+                    var size = sizes[k];
+                    double left = p.An switch { 7 => p.X, 8 => p.X - size.Width / 2, _ => p.X - size.Width };
+                    images.Add(new ImagePlacement(r.O.ImagePath!, (int)Math.Round(left), (int)Math.Round(p.Y), (int)size.Width, (int)size.Px));
+                    continue;
+                }
                 string tags = Tags(r, p, alpha);
                 string style = r.Edge == EdgeStyle.Box ? "Box" : "Default";
 
@@ -95,6 +109,7 @@ static class AssWriter
         }
 
         File.WriteAllText(path, sb.ToString(), new UTF8Encoding(false));
+        return images;
     }
 
     // Override tags for one row: placement, font, size, colour and edge

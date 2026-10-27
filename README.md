@@ -16,6 +16,8 @@ pick a style, and click Run.
   - **Rows at the same position stack** in list order, and can line up by their left edges, centers or right edges.
   - **Type `\n` for a new line**, in the text or in a date format.
   - **Font warnings:** an orange Font cell means either the font's digits vary in width (changing numbers wobble), or it reserves very tall lines, so its letters come out tiny (see [Fonts](#fonts)).
+- **Pictures** (logos, banners): drop a PNG, JPG, BMP, GIF or TIFF onto the preview and it goes in the position you drop it on. Dropping it on the overlay table or the window, or using *Add overlay → Picture...*, also works. A picture row stacks and lines up with text rows, *Size %* sets its height, and transparency is kept. Double-click its row to swap the file. Pictures can only be **burned in**: subtitle files can't hold them.
+- **Never overwrites anything:** if an output name is taken, the next free one is used (see [Output files](#output-files)).
 
   Fill the text with tokens:
 
@@ -141,6 +143,12 @@ Outputs are written next to each video. Your originals are never changed.
 | External subtitle file | `clip.ass`. VLC and mpv load it automatically with `clip.mp4`. |
 | Subtitle stream | `clip_timecode.mkv` (streams copied; turn subtitles on in the player) |
 | Burn into picture | `clip_timecode_burned.mp4` / `.mov` / `.mkv` (same container type as the source where possible) |
+
+**Existing files are never overwritten.** If a name is already taken (or already claimed by
+another video in the same batch), the next free one is used:
+
+- **Videos:** `clip_timecode_burned (2).mp4`, `(3)`, ...
+- **Subtitle files:** `clip.2.ass`, `clip.3.ass`, ... This form keeps players loading them automatically with `clip.mp4`. If an older `clip.ass` is also there, a player may show both, so delete the one you don't want.
 
 ## Burn-in encoding
 

@@ -97,6 +97,8 @@ sealed class MainForm : Form
     readonly DateTimePicker dtpStart = new() { Format = DateTimePickerFormat.Custom, CustomFormat = "yyyy-MM-dd  h:mm:ss tt", Width = 180, Margin = new Padding(6, 3, 3, 3) };
     readonly NumericUpDown numStartMs = new() { Maximum = 999, Width = 50 };
     readonly Label lblMs = new() { Text = "ms", AutoSize = true, Margin = new Padding(3, 7, 3, 3) };
+    readonly ToolTip tips = new();
+    Control manualStartPanel = null!;
     Control startPanel = null!;
 
     public MainForm(IEnumerable<string> paths, bool useSaved, string? preset, bool exitWhenDone)
@@ -275,7 +277,11 @@ sealed class MainForm : Form
         cbZone.Items.Add(new Choice("Automatic  (camera's own offset if recorded, else this PC's zone)", ""));
         foreach (var z in TimeZoneInfo.GetSystemTimeZones()) cbZone.Items.Add(new Choice(z.DisplayName, z.Id));
         cbStartMode.Items.AddRange(new object[] { "From the file", "From the file, shifted by", "Set manually" });
-        startPanel = Flow(cbStartMode, tbShift, lblShiftHint, dtpStart, numStartMs, lblMs);
+        // The date picker stops at whole seconds, so milliseconds sit right after it, in one group
+        manualStartPanel = Flow(dtpStart, new Label { Text = "+", AutoSize = true, Margin = new Padding(3, 7, 0, 3) }, numStartMs, lblMs);
+        startPanel = Flow(cbStartMode, tbShift, lblShiftHint, manualStartPanel);
+        tips.SetToolTip(numStartMs, "Milliseconds added to the time on the left (0-999), for a start time finer than a second");
+        tips.SetToolTip(dtpStart, "Date and time of the first frame, in the chosen time zone");
         timePanel = FormTable(
             ("Label format", Flow(cbFormat, Btn("Format help...", (_, _) => ShowFormatHelp(), 110))),
             ("Start time", startPanel),
@@ -333,6 +339,11 @@ sealed class MainForm : Form
         var addMenu = new ContextMenuStrip();
         foreach (var p in OverlayPresets)
             addMenu.Items.Add($"{p.Name}   {p.Text}", null, (_, _) => AddOverlay(p.Text, p.Size));
+        addMenu.Items.Add(new ToolStripSeparator());
+        addMenu.Items.Add("Picture...   (or drop one on the preview)", null, (_, _) =>
+        {
+            if (PickPicture() is { } file) AddImageOverlay(file, null);
+        });
         var tokenMenu = new ContextMenuStrip();
         foreach (var (token, desc) in Template.Tokens)
             tokenMenu.Items.Add($"{token}   {desc}", null, (_, _) => InsertToken(token));
@@ -465,7 +476,7 @@ sealed class MainForm : Form
         foreach (var c in new Control[] { this, lvFiles })
         {
             c.DragEnter += (_, e) => { if (!running && e.Data?.GetDataPresent(DataFormats.FileDrop) == true) e.Effect = DragDropEffects.Copy; };
-            c.DragDrop += (_, e) => { if (e.Data?.GetData(DataFormats.FileDrop) is string[] p) AddPaths(p); };
+            c.DragDrop += (_, e) => { if (e.Data?.GetData(DataFormats.FileDrop) is string[] p) AddDropped(p, null); };
         }
         lvFiles.Resize += (_, _) => SizeColumns();
         SizeColumns();
@@ -504,8 +515,57 @@ sealed class MainForm : Form
                 tb.TextChanged += GridTextChanged;
             }
         };
+        // Pictures: drop on the preview to place one where it lands, or on the table for a free position
+        preview.AllowDrop = grid.AllowDrop = true;
+        preview.DragOver += (_, e) =>
+        {
+            if (running || DroppedPictures(e).Count == 0) { e.Effect = DragDropEffects.None; return; }
+            e.Effect = DragDropEffects.Copy;
+            preview.DropTarget = preview.AnchorAt(preview.PointToClient(new Point(e.X, e.Y)));
+        };
+        preview.DragLeave += (_, _) => preview.DropTarget = null;
+        preview.DragDrop += (_, e) =>
+        {
+            var at = preview.AnchorAt(preview.PointToClient(new Point(e.X, e.Y)));
+            preview.DropTarget = null;
+            foreach (var f in DroppedPictures(e)) AddImageOverlay(f, at);
+        };
+        grid.DragEnter += (_, e) => e.Effect = !running && DroppedPictures(e).Count > 0 ? DragDropEffects.Copy : DragDropEffects.None;
+        grid.DragDrop += (_, e) => { foreach (var f in DroppedPictures(e)) AddImageOverlay(f, null); };
+        grid.CellBeginEdit += (_, e) =>
+        {
+            // A picture row's Text cell shows the file; double-click it to pick another picture
+            if (e.RowIndex >= 0 && e.RowIndex < overlays.Count && overlays[e.RowIndex].IsImage) e.Cancel = true;
+        };
+        grid.CellDoubleClick += (_, e) =>
+        {
+            if (e.RowIndex < 0 || e.RowIndex >= overlays.Count || !overlays[e.RowIndex].IsImage || grid.Columns[e.ColumnIndex].Name != "Text") return;
+            if (PickPicture() is { } file)
+            {
+                overlays[e.RowIndex].ImagePath = file;
+                grid.InvalidateRow(e.RowIndex);
+                preview.Invalidate();
+            }
+        };
+
         grid.CellFormatting += (_, e) =>
         {
+            if (e.RowIndex >= 0 && e.RowIndex < overlays.Count && overlays[e.RowIndex].IsImage
+                && grid.Columns[e.ColumnIndex].Name is "Text" or "Font" or "Edge" or "Color")
+            {
+                var path = overlays[e.RowIndex].ImagePath!;
+                bool ok = OverlayImages.SizeOf(path) != null;
+                e.Value = grid.Columns[e.ColumnIndex].Name == "Text"
+                    ? $"Picture: {Path.GetFileName(path)}{(ok ? "" : "  (not found)")}"
+                    : "-";
+                if (e.CellStyle != null)
+                {
+                    e.CellStyle.ForeColor = e.CellStyle.SelectionForeColor = ok ? SystemColors.GrayText : Color.Firebrick;
+                    e.CellStyle.BackColor = e.CellStyle.SelectionBackColor = SystemColors.Window;
+                }
+                e.FormattingApplied = true;
+                return;
+            }
             if (e.RowIndex >= 0 && e.RowIndex < overlays.Count && grid.Columns[e.ColumnIndex].Name == "Position")
             {
                 var pos = overlays[e.RowIndex].Position;
@@ -760,11 +820,18 @@ sealed class MainForm : Form
         var s = CurrentSettings();
 
         if (lvFiles.Items.Count == 0) { Warn("Add at least one video first."); return; }
+        var pictures = s.Overlays.Where(o => o.Enabled && o.IsImage).ToList();
+        var missing = pictures.Where(o => OverlayImages.SizeOf(o.ImagePath!) == null).Select(o => o.ImagePath!).ToList();
+        if (missing.Count > 0)
+        { Warn("These pictures can't be found or read:\n\n" + string.Join("\n", missing) + "\n\nReplace them (double-click the row), remove them, or untick them."); return; }
+        if (pictures.Count > 0 && s.Mode != OutputMode.Burn && !fromSetup &&
+            MessageBox.Show(this, "Pictures only appear when burning into the picture; subtitle files can't hold them.\n\nContinue without the pictures?",
+                "Video Timecode", MessageBoxButtons.OKCancel, MessageBoxIcon.Information) != DialogResult.OK) return;
         if (s.Mode == OutputMode.Burn && !chkAutoEncoders.Checked && chosenEncoders.Count == 0)
         { Warn("Tick at least one encoder, or choose Automatic."); return; }
         if (s.StartMode == StartTimeMode.Shifted && !TemplateContext.TryParseShift(tbShift.Text, out _))
         { Warn("Enter the shift as h:mm:ss, e.g. +1:00:00 or -0:00:12.5"); return; }
-        if (!s.Overlays.Any(o => o.Enabled && !string.IsNullOrWhiteSpace(o.Text))) { Warn("Add at least one text overlay."); return; }
+        if (!s.Overlays.Any(o => o.Enabled && (o.IsImage || !string.IsNullOrWhiteSpace(o.Text)))) { Warn("Add at least one overlay."); return; }
         try { _ = DateTime.Now.ToString(s.DateFormat, CultureInfo.InvariantCulture); }
         catch (FormatException) { Warn("The label format isn't a valid date format."); return; }
 
@@ -866,8 +933,9 @@ sealed class MainForm : Form
             IEnumerable<string> files =
                 Directory.Exists(p)
                     ? Directory.GetFiles(p).Where(f => VideoExtensions.Contains(Path.GetExtension(f).ToLowerInvariant()))
-                        .Where(f => !Path.GetFileNameWithoutExtension(f).EndsWith("_timecode", StringComparison.OrdinalIgnoreCase)
-                                 && !Path.GetFileNameWithoutExtension(f).EndsWith("_timecode_burned", StringComparison.OrdinalIgnoreCase))
+                        // Skip this app's own outputs, including numbered ones like "clip_timecode_burned (2)"
+                        .Where(f => !System.Text.RegularExpressions.Regex.IsMatch(Path.GetFileNameWithoutExtension(f),
+                                 @"_timecode(_burned)?( \(\d+\))?$", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
                         .OrderBy(f => f, StringComparer.OrdinalIgnoreCase)
                     : File.Exists(p) ? new[] { p } : Array.Empty<string>();
             foreach (var f in files)
@@ -920,6 +988,7 @@ sealed class MainForm : Form
     bool CellButton(int row, int col)
     {
         if (row < 0 || row >= overlays.Count || col < 0) return false;
+        if (overlays[row].IsImage && grid.Columns[col].Name is "Font" or "Edge" or "Color") return true;   // not used by pictures
         switch (grid.Columns[col].Name)
         {
             case "Position":
@@ -1033,7 +1102,7 @@ sealed class MainForm : Form
     {
         var mode = (StartTimeMode)Math.Max(0, cbStartMode.SelectedIndex);
         tbShift.Visible = lblShiftHint.Visible = mode == StartTimeMode.Shifted;
-        dtpStart.Visible = numStartMs.Visible = lblMs.Visible = mode == StartTimeMode.Manual;
+        manualStartPanel.Visible = mode == StartTimeMode.Manual;
         cbMarks.Enabled = mode != StartTimeMode.Manual;   // a typed-in time is always the first frame's
     }
 
@@ -1101,6 +1170,7 @@ sealed class MainForm : Form
     // A problem with this overlay's font, or null
     string? FontWarning(Overlay o)
     {
+        if (o.IsImage) return null;
         var font = o.FontName ?? StyleFont;
         if (FontMetrics.Get(font, o.Bold ?? chkBold.Checked).LineHeight > FontMetrics.TallLineHeight)
             return "This font reserves very tall lines, so its letters come out much smaller than the size you set.";
@@ -1154,10 +1224,43 @@ sealed class MainForm : Form
         menu.Show(grid, new Point(r.Left, r.Bottom));
     }
 
+    // Sorts dropped files: pictures become overlays, everything else goes to the video list
+    void AddDropped(string[] paths, Anchor9? at)
+    {
+        foreach (var f in paths.Where(p => File.Exists(p) && OverlayImages.IsImageFile(p))) AddImageOverlay(f, at);
+        AddPaths(paths.Where(p => !(File.Exists(p) && OverlayImages.IsImageFile(p))));
+    }
+
+    static List<string> DroppedPictures(DragEventArgs e) =>
+        e.Data?.GetData(DataFormats.FileDrop) is string[] p ? p.Where(f => File.Exists(f) && OverlayImages.IsImageFile(f)).ToList() : new();
+
+    string? PickPicture()
+    {
+        using var d = new OpenFileDialog
+        {
+            Title = "Choose a picture",
+            Filter = "Pictures|" + string.Join(";", OverlayImages.Extensions.Select(x => "*" + x)) + "|All files|*.*",
+        };
+        return d.ShowDialog(this) == DialogResult.OK ? d.FileName : null;
+    }
+
+    void AddImageOverlay(string path, Anchor9? at)
+    {
+        if (OverlayImages.SizeOf(path) == null) { Warn($"\"{Path.GetFileName(path)}\" couldn't be read as a picture."); return; }
+        grid.EndEdit();
+        var used = overlays.Select(o => o.Position).ToHashSet();
+        var pos = at ?? FreePositionOrder.FirstOrDefault(p => !used.Contains(p), Anchor9.TopLeft);
+        overlays.Add(new Overlay { ImagePath = path, Text = "", Size = 10, Position = pos });
+        grid.CurrentCell = grid.Rows[overlays.Count - 1].Cells["Size"];
+        preview.Invalidate();
+        SetStatus($"Added picture \"{Path.GetFileName(path)}\" at {Positions.First(p => p.Value == pos).Name.ToLowerInvariant()}." +
+                  (rbBurn.Checked ? " Size % sets its height." : " Pictures only appear when burning in."));
+    }
+
     void InsertToken(string token)
     {
         int row = grid.CurrentCell?.RowIndex ?? -1;
-        if (row < 0 || row >= overlays.Count) { AddOverlay(token, 4); return; }
+        if (row < 0 || row >= overlays.Count || overlays[row].IsImage) { AddOverlay(token, 4); return; }
         grid.EndEdit();
         overlays[row].Text += token;
         grid.InvalidateRow(row);

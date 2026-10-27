@@ -11,6 +11,7 @@ sealed class Job
     public VideoInfo? Info;
     public string? AssPath, TempDir, Output;
     public string Codec = "", Cls = "";
+    public List<ImagePlacement> Images = new();
     public readonly HashSet<string> FailedWorkers = new();
     public bool ForceMkv, Succeeded, Failed;
 }
@@ -30,6 +31,33 @@ sealed class JobRunner
         this.report = report;
         this.log = log;
         zone = string.IsNullOrEmpty(s.TimeZoneId) ? TimeZoneInfo.Local : TimeZoneInfo.FindSystemTimeZoneById(s.TimeZoneId);
+    }
+
+    // Output names already handed out in this batch (two inputs can want the same name, e.g. clip.mp4 and clip.mov)
+    readonly HashSet<string> reserved = new(StringComparer.OrdinalIgnoreCase);
+
+    // The first free name: "name.ext", then "name (2).ext", "name (3).ext"... Subtitle files
+    // become "clip.2.ass" instead, so players still load them automatically with clip.mp4.
+    string Reserve(string desired)
+    {
+        var dir = Path.GetDirectoryName(desired)!;
+        var ext = Path.GetExtension(desired);
+        var stem = Path.GetFileNameWithoutExtension(desired);
+        bool subtitle = ext.Equals(".ass", StringComparison.OrdinalIgnoreCase);
+        lock (reserved)
+        {
+            for (int n = 1; ; n++)
+            {
+                var candidate = n == 1 ? desired : Path.Combine(dir, subtitle ? $"{stem}.{n}{ext}" : $"{stem} ({n}){ext}");
+                if (!File.Exists(candidate) && reserved.Add(candidate)) return candidate;
+            }
+        }
+    }
+
+    void Release(string? path)
+    {
+        if (path == null) return;
+        lock (reserved) reserved.Remove(path);
     }
 
     // Jobs that run at once: enough to keep a GPU busy (one job alone leaves it mostly idle),
@@ -71,7 +99,7 @@ sealed class JobRunner
 
         if (s.Mode == OutputMode.Subs)
         {
-            job.AssPath = Path.ChangeExtension(job.Input, ".ass");
+            job.AssPath = Reserve(Path.ChangeExtension(job.Input, ".ass"));
         }
         else
         {
@@ -79,7 +107,8 @@ sealed class JobRunner
             Directory.CreateDirectory(job.TempDir);
             job.AssPath = Path.Combine(job.TempDir, "tc.ass");
         }
-        AssWriter.Write(job.AssPath, ctx);
+        // Pictures can only be burned in; subtitle outputs leave them out of the layout
+        job.Images = AssWriter.Write(job.AssPath, ctx, includeImages: s.Mode == OutputMode.Burn);
 
         var label = ctx.LocalAt(0);
         log($"{job.Input}\n  date from {ctx.StartSource}; first frame {label.ToString("yyyy-MM-dd HH:mm:ss.fff zzz", CultureInfo.InvariantCulture)}; " +
@@ -210,13 +239,20 @@ sealed class JobRunner
         var v = job.Info!;
         string ext = OutputExtension(job);
         bool mp4Family = ext is ".mp4" or ".mov";
-        job.Output = Path.Combine(Path.GetDirectoryName(job.Input)!, Path.GetFileNameWithoutExtension(job.Input) + "_timecode_burned" + ext);
+        job.Output = Reserve(Path.Combine(Path.GetDirectoryName(job.Input)!, Path.GetFileNameWithoutExtension(job.Input) + "_timecode_burned" + ext));
 
-        var a = new List<string> { "-hide_banner", "-nostdin", "-y", "-loglevel", "error" };
+        // -n: never overwrite, even if a file appeared since the name was chosen
+        var a = new List<string> { "-hide_banner", "-nostdin", "-n", "-loglevel", "error" };
         a.AddRange(EncodePlan.DecodeArgs(w));
-        a.AddRange(new[] { "-i", job.Input, "-map", "0:v:0", "-map", "0:a?" });
+        a.AddRange(new[] { "-i", job.Input });
+        foreach (var img in job.Images) a.AddRange(new[] { "-i", img.Path });
+        if (job.Images.Count == 0)
+            a.AddRange(new[] { "-map", "0:v:0", "-vf", "subtitles=tc.ass" });
+        else
+            a.AddRange(new[] { "-filter_complex", ImageGraph(job), "-map", "[vout]" });
+        a.AddRange(new[] { "-map", "0:a?" });
         if (ext == ".mkv" && IsMkv(job.Input)) a.AddRange(new[] { "-map", "0:s?", "-c:s", "copy" });
-        a.AddRange(new[] { "-vf", "subtitles=tc.ass", "-fps_mode", "passthrough" });
+        a.AddRange(new[] { "-fps_mode", "passthrough" });
         a.AddRange(EncodePlan.VideoArgs(v, s, job.Codec, job.Cls, w, mp4Family));
         a.AddRange(new[] { "-c:a", "copy", "-map_metadata", "0", "-map_chapters", "0" });
         if (mp4Family)
@@ -230,12 +266,30 @@ sealed class JobRunner
         return await RunFfmpegAsync(job, a, $"{EncodePlan.EncoderName(job.Codec, w)} on {label}", ct);
     }
 
+    // Pictures are scaled and placed first (still images repeat their only frame for the whole
+    // clip), then converted back to the source's own format (placing them adds an alpha layer
+    // the encoders reject), then the text is drawn on top
+    string ImageGraph(Job job)
+    {
+        var g = new System.Text.StringBuilder();
+        string prev = "[0:v]";
+        for (int k = 0; k < job.Images.Count; k++)
+        {
+            var img = job.Images[k];
+            g.Append(CultureInfo.InvariantCulture, $"[{k + 1}:v]scale={img.W}:{img.H},format=rgba[i{k}];");
+            g.Append(CultureInfo.InvariantCulture, $"{prev}[i{k}]overlay={img.X}:{img.Y}:format=auto[o{k}];");
+            prev = $"[o{k}]";
+        }
+        g.Append(prev).Append("format=").Append(Pix.SoftwareFormat(job.Cls)).Append(",subtitles=tc.ass[vout]");
+        return g.ToString();
+    }
+
     async Task<bool> EmbedAsync(Job job, CancellationToken ct)
     {
-        job.Output = Path.Combine(Path.GetDirectoryName(job.Input)!, Path.GetFileNameWithoutExtension(job.Input) + "_timecode.mkv");
+        job.Output = Reserve(Path.Combine(Path.GetDirectoryName(job.Input)!, Path.GetFileNameWithoutExtension(job.Input) + "_timecode.mkv"));
         var a = new List<string>
         {
-            "-hide_banner", "-nostdin", "-y", "-loglevel", "error", "-i", job.Input, "-i", job.AssPath!,
+            "-hide_banner", "-nostdin", "-n", "-loglevel", "error", "-i", job.Input, "-i", job.AssPath!,
             "-map", "0:v", "-map", "0:a?", "-map", "1:0", "-c", "copy", "-c:s", "ass",
             "-metadata:s:s:0", "title=Timecode", "-metadata:s:s:0", "language=eng", "-disposition:s:0", "default",
             "-map_metadata", "0", "-map_chapters", "0", "-progress", "pipe:1", "-nostats", job.Output,
@@ -265,7 +319,11 @@ sealed class JobRunner
             Done(job, $"Done: {Path.GetFileName(job.Output)} ({what})");
             return true;
         }
-        try { if (job.Output != null) File.Delete(job.Output); } catch { }
+        // The name was free when reserved, so anything there now is our partial output -
+        // unless ffmpeg refused because a file appeared there meanwhile (-n)
+        if (!r.Stderr.Contains("already exists", StringComparison.OrdinalIgnoreCase))
+            try { if (job.Output != null) File.Delete(job.Output); } catch { }
+        Release(job.Output);
         var err = Probe.ErrorLine(r.Stderr);
         log($"  FAILED ({what}): {r.Stderr.Trim()}");
         report(job, $"Failed ({what}): {err}", null);

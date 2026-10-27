@@ -30,6 +30,10 @@ public sealed class Overlay
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? FontName { get; set; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public bool? Bold { get; set; }
 
+    // A picture instead of text (burn-in only); Size is then its height as % of the video height
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? ImagePath { get; set; }
+    [JsonIgnore] public bool IsImage => ImagePath != null;
+
     // Per-overlay edge; null uses the Style edge / edge colour
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public EdgeStyle? Edge { get; set; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? EdgeColor { get; set; }
