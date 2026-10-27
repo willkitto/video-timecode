@@ -58,7 +58,11 @@ sealed class MainForm : Form
     readonly RadioButton rbSubs = new() { Text = "External subtitle file (.ass next to the video)  -  fastest; video untouched", AutoSize = true };
     readonly RadioButton rbEmbed = new() { Text = "Subtitle stream in a new .mkv  -  switch on/off in the player; no quality loss", AutoSize = true };
     readonly RadioButton rbBurn = new() { Text = "Burn into the picture  -  always visible; re-encoded to match the source", AutoSize = true };
-    readonly ComboBox cbCodec = Drop(), cbQuality = Drop(), cbEncoder = Drop(330), cbParallel = Drop();
+    readonly ComboBox cbCodec = Drop(), cbQuality = Drop(), cbParallel = Drop();
+    readonly CheckBox chkAutoEncoders = new() { Text = "Automatic  -  GPUs when possible (fastest)", AutoSize = true, Margin = new Padding(3, 5, 3, 0) };
+    readonly CheckedListBox clbEncoders = new() { CheckOnClick = true, Width = 330, Height = 74, IntegralHeight = false, Margin = new Padding(3, 2, 3, 3) };
+    List<string> chosenEncoders = new();   // ticked encoder ids; empty = automatic
+    bool renderingEncoders;
     readonly DataGridView grid = new();
     readonly ComboBox cbFont = Drop(200), cbEdge = Drop(130);
     readonly CheckBox chkEven = new() { Text = "Only fonts with even-width digits (no wobble)", AutoSize = true, Checked = true };
@@ -80,6 +84,9 @@ sealed class MainForm : Form
     Control fileButtons = null!, outputPanel = null!, encodePanel = null!, timePanel = null!, rightPanel = null!, presetBar = null!;
 
     static ComboBox Drop(int width = 260) => new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = width };
+
+    // A down-pointing triangle; built from its code so the source stays plain ASCII
+    static readonly string Arrow = "  " + (char)0x25BE;
 
     public MainForm(IEnumerable<string> paths, bool useSaved, string? preset, bool exitWhenDone)
     {
@@ -241,7 +248,9 @@ sealed class MainForm : Form
         cbCodec.Items.AddRange(new object[] { "Same as source (recommended)", "H.264  -  most compatible", "HEVC / H.265  -  smaller files", "AV1  -  smallest; newer players" });
         cbQuality.Items.AddRange(new object[] { "Match source bitrate (recommended)", "Higher  -  1.5x source bitrate", "Smaller file  -  0.6x source bitrate" });
         cbParallel.Items.AddRange(new object[] { $"Automatic ({JobRunner.AutoParallel} at a time on this PC)", "1 at a time", "2 at a time", "3 at a time", "4 at a time" });
-        encodePanel = FormTable(("Video codec", cbCodec), ("Quality", cbQuality), ("Encoder", cbEncoder), ("Parallel jobs", cbParallel));
+        var encoders = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, AutoSize = true, WrapContents = false, Margin = Padding.Empty };
+        encoders.Controls.AddRange(new Control[] { chkAutoEncoders, clbEncoders });
+        encodePanel = FormTable(("Video codec", cbCodec), ("Quality", cbQuality), ("Encoders", encoders), ("Parallel jobs", cbParallel));
         encodePanel.Margin = new Padding(34, 2, 0, 0);
         outputPanel = Column((radios, 0), (encodePanel, 0));
 
@@ -291,7 +300,12 @@ sealed class MainForm : Form
                 Name = "Position", HeaderText = "Position", FillWeight = 22, FlatStyle = FlatStyle.Flat,
                 DefaultCellStyle = { Alignment = DataGridViewContentAlignment.MiddleLeft },
             },
-            new DataGridViewTextBoxColumn { Name = "Text", DataPropertyName = nameof(Overlay.Text), HeaderText = "Text  ({tokens} are filled in per frame)", FillWeight = 52 },
+            new DataGridViewTextBoxColumn { Name = "Text", DataPropertyName = nameof(Overlay.Text), HeaderText = "Text  ({tokens} are filled in per frame)", FillWeight = 34 },
+            new DataGridViewButtonColumn
+            {
+                Name = "Font", HeaderText = "Font", FillWeight = 23, FlatStyle = FlatStyle.Flat,
+                DefaultCellStyle = { Alignment = DataGridViewContentAlignment.MiddleLeft },
+            },
             new DataGridViewTextBoxColumn { Name = "Size", DataPropertyName = nameof(Overlay.Size), HeaderText = "Size %", FillWeight = 9 },
             new DataGridViewButtonColumn { Name = "Color", DataPropertyName = nameof(Overlay.Color), HeaderText = "Color", FillWeight = 12, FlatStyle = FlatStyle.Flat });
         grid.DataSource = overlays;
@@ -313,7 +327,7 @@ sealed class MainForm : Form
 
         cbEdge.Items.AddRange(new object[] { "Outline", "Box behind text" });
         var style = FormTable(
-            ("Font", Flow(cbFont, chkBold, chkEven)),
+            ("Default font", Flow(cbFont, chkBold, chkEven)),
             ("Edge", Flow(cbEdge, btnEdgeColor, Lbl("Box opacity %"), numOpacity)));
 
         return Column(
@@ -350,7 +364,8 @@ sealed class MainForm : Form
         cbCodec.SelectedIndex = (int)settings.Codec;
         cbQuality.SelectedIndex = (int)settings.Quality;
         cbParallel.SelectedIndex = Math.Clamp(settings.ParallelJobs, 0, 4);
-        FillEncoders(settings.Encoder);
+        chosenEncoders = new List<string>(settings.Encoders);
+        RenderEncoders();
 
         SelectFont(settings.FontName);
         chkBold.Checked = settings.Bold;
@@ -380,28 +395,37 @@ sealed class MainForm : Form
         s.TimeZoneId = (cbZone.SelectedItem as Choice)?.Value ?? "";
         s.Codec = (CodecChoice)Math.Max(0, cbCodec.SelectedIndex);
         s.Quality = (QualityChoice)Math.Max(0, cbQuality.SelectedIndex);
-        s.Encoder = (cbEncoder.SelectedItem as Choice)?.Value ?? settings.Encoder;
+        // Keep ticks for encoders this PC doesn't have (e.g. a preset from another PC) until we know
+        s.Encoders = workers == null ? new(chosenEncoders) : chosenEncoders.Where(id => workers.Any(w => w.Id == id)).ToList();
         s.ParallelJobs = Math.Max(0, cbParallel.SelectedIndex);
         return s;
     }
 
-    void FillEncoders(string? wanted = null)
+    // Shows this PC's encoders. With Automatic on, the ticks show what it will use (greyed out).
+    void RenderEncoders()
     {
-        wanted ??= (cbEncoder.SelectedItem as Choice)?.Value ?? settings.Encoder;
-        cbEncoder.Items.Clear();
+        renderingEncoders = true;
+        clbEncoders.Items.Clear();
         if (workers == null)
         {
-            cbEncoder.Items.Add(new Choice("Automatic  (checking this PC's GPUs...)", "auto"));
+            clbEncoders.Items.Add(new Choice("(checking this PC's encoders...)", ""));
+            chkAutoEncoders.Checked = chosenEncoders.Count == 0;
+            clbEncoders.Enabled = false;
         }
         else
         {
-            var gpus = workers.Where(w => w.Vendor != Vendor.Cpu).ToList();
-            cbEncoder.Items.Add(new Choice(gpus.Count > 0 ? $"Automatic  -  share across {gpus.Count} GPU encoder{(gpus.Count > 1 ? "s" : "")}" : "Automatic  -  no GPU encoder found, uses CPU", "auto"));
-            foreach (var g in gpus) cbEncoder.Items.Add(new Choice(g.Name, g.Id));
-            cbEncoder.Items.Add(new Choice("CPU only  -  slowest, works everywhere", "cpu"));
+            var mine = chosenEncoders.Where(id => workers.Any(w => w.Id == id)).ToHashSet();
+            bool auto = mine.Count == 0;
+            bool anyGpu = workers.Any(w => w.Vendor != Vendor.Cpu);
+            chkAutoEncoders.Checked = auto;
+            foreach (var w in workers)
+            {
+                bool tick = auto ? w.Vendor != Vendor.Cpu || !anyGpu : mine.Contains(w.Id);
+                clbEncoders.Items.Add(new Choice(w.Vendor == Vendor.Cpu ? "CPU  (slowest; any format)" : w.Name, w.Id), tick);
+            }
+            clbEncoders.Enabled = !auto;
         }
-        var items = cbEncoder.Items.Cast<Choice>().ToList();
-        cbEncoder.SelectedIndex = Math.Max(0, items.FindIndex(c => c.Value == wanted));
+        renderingEncoders = false;
     }
 
     // --- events ------------------------------------------------------------------
@@ -417,6 +441,23 @@ sealed class MainForm : Form
         SizeColumns();
 
         foreach (var rb in new[] { rbSubs, rbEmbed, rbBurn }) rb.CheckedChanged += (_, _) => UpdateEnabled();
+
+        chkAutoEncoders.CheckedChanged += (_, _) =>
+        {
+            if (renderingEncoders) return;
+            // Turning Automatic off starts from what it was using
+            chosenEncoders = chkAutoEncoders.Checked
+                ? new()
+                : clbEncoders.CheckedItems.Cast<Choice>().Select(c => c.Value).Where(v => v != "").ToList();
+            if (workers != null) clbEncoders.Enabled = !chkAutoEncoders.Checked;
+        };
+        clbEncoders.ItemCheck += (_, e) =>
+        {
+            if (renderingEncoders || chkAutoEncoders.Checked) return;
+            var id = ((Choice)clbEncoders.Items[e.Index]).Value;
+            chosenEncoders.Remove(id);
+            if (e.NewValue == CheckState.Checked) chosenEncoders.Add(id);
+        };
 
         grid.CurrentCellDirtyStateChanged += (_, _) =>
         {
@@ -441,12 +482,27 @@ sealed class MainForm : Form
                 e.Value = (Positions.FirstOrDefault(p => p.Value == pos)?.Name ?? pos.ToString()) + "  \u25BE";
                 e.FormattingApplied = true;
             }
+            if (e.RowIndex >= 0 && e.RowIndex < overlays.Count && grid.Columns[e.ColumnIndex].Name == "Font")
+            {
+                var o = overlays[e.RowIndex];
+                e.Value = (o.FontName ?? "Default") + (o.Bold == true ? " Bold" : o.Bold == false && o.FontName == null ? " Regular" : "") + Arrow;
+                if (e.CellStyle != null)
+                    e.CellStyle.ForeColor = e.CellStyle.SelectionForeColor = MayWobble(o) ? Color.DarkOrange : SystemColors.ControlText;
+                e.FormattingApplied = true;
+            }
             if (e.RowIndex >= 0 && grid.Columns[e.ColumnIndex].Name == "Color" && e.CellStyle != null)
             {
                 var c = ColorUtil.Parse(e.Value as string);
                 e.CellStyle.BackColor = e.CellStyle.SelectionBackColor = c;
                 e.CellStyle.ForeColor = e.CellStyle.SelectionForeColor = ColorUtil.Contrasting(c);
             }
+        };
+        grid.CellToolTipTextNeeded += (_, e) =>
+        {
+            if (e.RowIndex < 0 || e.RowIndex >= overlays.Count || grid.Columns[e.ColumnIndex].Name != "Font") return;
+            e.ToolTipText = MayWobble(overlays[e.RowIndex])
+                ? "This font's digits have different widths, so changing numbers may wobble. Click to choose another font."
+                : "Click to choose a font for this overlay.";
         };
         // Any click in the cell (CellContentClick misses some clicks), or Space/Enter
         grid.CellClick += (_, e) => CellButton(e.RowIndex, e.ColumnIndex);
@@ -456,7 +512,7 @@ sealed class MainForm : Form
                 e.Handled = true;
         };
 
-        cbFont.SelectedIndexChanged += (_, _) => preview.Invalidate();
+        cbFont.SelectedIndexChanged += (_, _) => { preview.Invalidate(); grid.Invalidate(); };
         chkBold.CheckedChanged += (_, _) => preview.Invalidate();
         chkEven.CheckedChanged += (_, _) => FillFonts();
         cbEdge.SelectedIndexChanged += (_, _) => { numOpacity.Enabled = cbEdge.SelectedIndex == 1; preview.Invalidate(); };
@@ -578,10 +634,10 @@ sealed class MainForm : Form
         {
             workers = new() { EncoderCaps.Cpu() };
             SetStatus("GPU check failed, burn-in will use the CPU: " + ex.Message);
-            FillEncoders();
+            RenderEncoders();
             return;
         }
-        FillEncoders();
+        RenderEncoders();
         var gpus = workers.Where(w => w.Vendor != Vendor.Cpu).Select(w => w.Name).ToList();
         SetStatus(gpus.Count > 0 ? "Ready.  GPU encoders: " + string.Join(", ", gpus) : "Ready.  No GPU encoder found; burn-in will use the CPU.");
     }
@@ -656,6 +712,8 @@ sealed class MainForm : Form
         var s = CurrentSettings();
 
         if (lvFiles.Items.Count == 0) { Warn("Add at least one video first."); return; }
+        if (s.Mode == OutputMode.Burn && !chkAutoEncoders.Checked && chosenEncoders.Count == 0)
+        { Warn("Tick at least one encoder, or choose Automatic."); return; }
         if (!s.Overlays.Any(o => o.Enabled && !string.IsNullOrWhiteSpace(o.Text))) { Warn("Add at least one text overlay."); return; }
         try { _ = DateTime.Now.ToString(s.DateFormat, CultureInfo.InvariantCulture); }
         catch (FormatException) { Warn("The label format isn't a valid date format."); return; }
@@ -818,6 +876,9 @@ sealed class MainForm : Form
                 // After the grid finishes handling the click, or it takes focus back and closes the menu
                 BeginInvoke(() => ShowPositionMenu(row, col));
                 return true;
+            case "Font":
+                BeginInvoke(() => ShowFontMenu(row, col));
+                return true;
             case "Color":
                 var o = overlays[row];
                 if (PickColor(o.Color) is { } hex)
@@ -847,6 +908,60 @@ sealed class MainForm : Form
             };
             menu.Items.Add(item);
         }
+        menu.Closed += (_, _) => BeginInvoke(menu.Dispose);
+        var r = grid.GetCellDisplayRectangle(col, row, false);
+        menu.Show(grid, new Point(r.Left, r.Bottom));
+    }
+
+    string StyleFont => cbFont.SelectedItem as string ?? settings.FontName;
+
+    // True if this overlay changes per frame in a font whose digits differ in width
+    bool MayWobble(Overlay o)
+    {
+        var font = o.FontName ?? StyleFont;
+        return evenFonts.Count > 0 && allFonts.Contains(font) && !evenFonts.Contains(font) && new Template(o.Text).IsDynamic;
+    }
+
+    void ShowFontMenu(int row, int col)
+    {
+        var o = overlays[row];
+        void Set(string? font, bool? bold)
+        {
+            o.FontName = font;
+            o.Bold = bold;
+            grid.InvalidateRow(row);
+            preview.Invalidate();
+        }
+
+        var menu = new ContextMenuStrip();
+        var def = new ToolStripMenuItem($"Default  ({StyleFont}{(chkBold.Checked ? ", bold" : "")}, from Style)") { Checked = o.FontName == null };
+        def.Click += (_, _) => Set(null, null);
+        menu.Items.Add(def);
+        if (evenFonts.Count > 0)
+        {
+            var even = new ToolStripMenuItem("Fonts with even-width digits");
+            foreach (var f in evenFonts)
+            {
+                var item = new ToolStripMenuItem(f) { Checked = o.FontName == f };
+                item.Click += (_, _) => Set(f, o.Bold);
+                even.DropDownItems.Add(item);
+            }
+            menu.Items.Add(even);
+        }
+        var choose = new ToolStripMenuItem("Choose font...");
+        choose.Click += (_, _) => BeginInvoke(() =>
+        {
+            bool bold = o.Bold ?? chkBold.Checked;
+            using var d = new FontDialog { ShowEffects = false, ShowColor = false, FontMustExist = true, AllowVerticalFonts = false, AllowScriptChange = false };
+            try { d.Font = new Font(o.FontName ?? StyleFont, 14, bold ? FontStyle.Bold : FontStyle.Regular); } catch { }
+            if (d.ShowDialog(this) == DialogResult.OK) Set(d.Font.Name, d.Font.Bold);
+        });
+        menu.Items.Add(choose);
+        menu.Items.Add(new ToolStripSeparator());
+        var boldItem = new ToolStripMenuItem("Bold") { Checked = o.Bold ?? chkBold.Checked };
+        boldItem.Click += (_, _) => Set(o.FontName, !(o.Bold ?? chkBold.Checked));
+        menu.Items.Add(boldItem);
+
         menu.Closed += (_, _) => BeginInvoke(menu.Dispose);
         var r = grid.GetCellDisplayRectangle(col, row, false);
         menu.Show(grid, new Point(r.Left, r.Bottom));

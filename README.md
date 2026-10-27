@@ -11,7 +11,7 @@ pick a style, and click Run.
 ## Features
 
 - **Per-frame, sub-second labels** such as `2026-10-25 15:48:14.033`. Each frame gets its own value.
-- **Any number of text overlays**, in any of 9 positions, each with its own size and color. Fill them with tokens:
+- **Any number of text overlays**, in any of 9 positions, each with its own font, size and color. Rows use the Style font unless you pick another in the *Font* column; a warning appears if a font's digits vary in width, which makes changing numbers wobble. Fill the text with tokens:
 
   | Token | Shows |
   |---|---|
@@ -117,7 +117,13 @@ drawing the text) is the bottleneck. Running several at once fixes that. Measure
 
 So **Automatic** runs up to 4 videos at once, depending on how many CPU cores the PC has,
 spread across all GPU encoders. The CPU is used only when no GPU can produce the format.
-You can also pick a specific encoder, *CPU only*, or a fixed number of parallel jobs.
+
+To choose yourself, untick *Automatic* and tick one or more encoders. The batch is then
+shared between just those, and the CPU counts as an extra encoder if ticked. A file goes only
+to the encoders you ticked: if none of them can handle it (for example 10-bit 4:2:2 on a GPU
+without support for it), the file is marked as failed, with a suggestion to tick another
+encoder, instead of quietly using one you didn't pick. *Parallel jobs* sets how many videos
+run at once.
 
 ## Where the time comes from
 

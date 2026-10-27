@@ -111,7 +111,12 @@ sealed class JobRunner
                         var (free, impossible) = PickWorker(job);
                         if (impossible)
                         {
-                            Fail(job, $"No encoder here can produce {Template.CodecName(job.Codec)} {Pix.Describe(job.Cls)}.");
+                            var what = $"{Template.CodecName(job.Codec)} {Pix.Describe(job.Cls)}";
+                            Fail(job, Chosen() == null
+                                ? $"No encoder here can produce {what}."
+                                : job.FailedWorkers.Count > 0
+                                    ? $"The ticked encoders couldn't produce {what}; tick another encoder (e.g. CPU) and run again."
+                                    : $"None of the ticked encoders can produce {what}; tick another encoder (e.g. CPU).");
                             pending.RemoveAt(k);
                             continue;
                         }
@@ -142,7 +147,12 @@ sealed class JobRunner
                         report(j, "Retrying...", 0);
                         pending.Insert(0, j);
                     }
-                    else j.Failed = true;
+                    else
+                    {
+                        j.Failed = true;
+                        if (worker is { Vendor: not Vendor.Cpu } && Chosen() != null)
+                            report(j, "Failed on the ticked encoders; tick another encoder (e.g. CPU) and run again. Details in the log.", null);
+                    }
                 }
             }
         }
@@ -153,25 +163,28 @@ sealed class JobRunner
         }
     }
 
-    // A free encoder for the job. GPUs are preferred; the CPU is used only when no GPU can
-    // produce the format (measured: adding CPU encodes alongside GPU ones slows the batch).
+    // Encoders the user ticked that exist on this PC, or null for automatic
+    HashSet<string>? Chosen()
+    {
+        var ids = s.Encoders.Where(id => workers.Any(w => w.Id == id)).ToHashSet();
+        return ids.Count > 0 ? ids : null;
+    }
+
+    // A free encoder for the job. Automatic uses GPUs, and the CPU only when no GPU can produce
+    // the format (measured: adding CPU encodes alongside GPU ones slows the batch). With encoders
+    // ticked, the job goes only to those, sharing the work between them.
     (Worker? Free, bool Impossible) PickWorker(Job job)
     {
-        var eligible = workers.Where(w => w.Supports(job.Codec, job.Cls) && !job.FailedWorkers.Contains(w.Id));
-        if (s.Encoder == "cpu")
-            eligible = eligible.Where(w => w.Vendor == Vendor.Cpu);
-        else if (s.Encoder != "auto")
-        {
-            var chosen = eligible.Where(w => w.Id == s.Encoder).ToList();
-            eligible = chosen.Count > 0 ? chosen : eligible.Where(w => w.Vendor == Vendor.Cpu);
-        }
-        var list = eligible.ToList();
-        if (list.Count == 0) return (null, true);
+        var chosen = Chosen();
+        var eligible = workers.Where(w => w.Supports(job.Codec, job.Cls) && !job.FailedWorkers.Contains(w.Id)
+                                          && (chosen == null || chosen.Contains(w.Id))).ToList();
+        if (eligible.Count == 0) return (null, true);
 
-        var gpus = list.Where(w => w.Vendor != Vendor.Cpu).ToList();
-        var pool = gpus.Count > 0 ? gpus : list;
+        IEnumerable<Worker> pool = eligible;
+        if (chosen == null && eligible.Any(w => w.Vendor != Vendor.Cpu)) pool = eligible.Where(w => w.Vendor != Vendor.Cpu);
         var free = pool.Where(w => w.Active < w.Slots)
             .OrderBy(w => (double)w.Active / w.Slots)
+            .ThenBy(w => w.Vendor == Vendor.Cpu)
             .ThenBy(w => workers.ToList().IndexOf(w))
             .FirstOrDefault();
         return (free, false);

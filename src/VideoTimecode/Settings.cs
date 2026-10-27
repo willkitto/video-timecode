@@ -25,6 +25,10 @@ public sealed class Overlay
     public double Size { get; set; } = 5;   // percent of video height
     public string Color { get; set; } = "#FFFFFF";
 
+    // Per-overlay font; null uses the Style font / bold setting
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? FontName { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public bool? Bold { get; set; }
+
     public Overlay Clone() => (Overlay)MemberwiseClone();
 }
 
@@ -45,8 +49,13 @@ public sealed class AppSettings
 
     public CodecChoice Codec { get; set; } = CodecChoice.MatchSource;
     public QualityChoice Quality { get; set; } = QualityChoice.MatchSource;
-    public string Encoder { get; set; } = "auto";  // "auto", "cpu", or a worker id such as "nvenc:0"
+    // Worker ids to share burn-in jobs between, e.g. "nvenc:0", "qsv", "cpu"; empty = automatic
+    public List<string> Encoders { get; set; } = new();
     public int ParallelJobs { get; set; }          // 0 = automatic
+
+    // Before 2.2 a single encoder id ("auto", "cpu", "nvenc:0", ...) was stored here
+    [JsonPropertyName("Encoder"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? LegacyEncoder { get; set; }
 
     static readonly JsonSerializerOptions Json = new()
     {
@@ -73,8 +82,15 @@ public sealed class AppSettings
 
     public static AppSettings? LoadFile(string path)
     {
-        try { return JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(path), Json); }
+        try { return JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(path), Json)?.Upgrade(); }
         catch { return null; }
+    }
+
+    AppSettings Upgrade()
+    {
+        if (Encoders.Count == 0 && LegacyEncoder is { Length: > 0 } e && e != "auto") Encoders = new() { e };
+        LegacyEncoder = null;
+        return this;
     }
 
     public void SaveFile(string path)
@@ -87,6 +103,7 @@ public sealed class AppSettings
     {
         var c = (AppSettings)MemberwiseClone();
         c.Overlays = Overlays.Select(o => o.Clone()).ToList();
+        c.Encoders = new List<string>(Encoders);
         return c;
     }
 

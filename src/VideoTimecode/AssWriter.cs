@@ -41,7 +41,9 @@ static class AssWriter
             {
                 int px = Math.Max(1, (int)Math.Round(h * o.Size / 100));
                 int bord = box ? Math.Max(1, px / 5) : Math.Max(1, (int)Math.Round(px / 14.0));
-                var prefix = $"{{\\fs{px}\\bord{bord}\\c{ColorUtil.ToAssInline(ColorUtil.Parse(o.Color))}}}";
+                var font = o.FontName == null ? "" : "\\fn" + o.FontName.Replace("\\", "").Replace("{", "").Replace("}", "");
+                var bold = o.Bold is { } b ? $"\\b{(b ? 1 : 0)}" : "";
+                var prefix = $"{{{font}{bold}\\fs{px}\\bord{bord}\\c{ColorUtil.ToAssInline(ColorUtil.Parse(o.Color))}}}";
                 return (Template: new Template(o.Text), Prefix: prefix);
             }).ToList();
             string an = $"{{\\an{(int)g.Key}}}";
