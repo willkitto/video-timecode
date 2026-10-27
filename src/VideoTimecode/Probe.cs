@@ -17,9 +17,13 @@ sealed class VideoInfo
     public List<double> FrameTimes = new();
 
     public DateTimeOffset Start;
-    public bool HasDate;                    // a recording date was found in the file
+    public bool HasDate;                    // a recording date was found (inside the file, or its modified time)
     public bool FixedOffset;                // Start already carries the camera's own UTC offset
     public string StartSource = "";
+    public bool DateMarksEnd;               // the recording format stamps the end, not the start
+    public string MarksReason = "";         // why, for Automatic
+    public bool MarksKnown;                 // the format is known to stamp that end (not just the usual guess)
+    public bool DateFromFileTime;           // no date inside the file: its modified time stands in
 
     public string PixClass => Pix.ClassOf(PixFmt);
 }
@@ -28,7 +32,8 @@ static class Probe
 {
     static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
 
-    public static async Task<VideoInfo> ReadAsync(string path, CancellationToken ct)
+    // frames: false skips reading every frame's time, for a quick look at a file's date and camera
+    public static async Task<VideoInfo> ReadAsync(string path, CancellationToken ct, bool frames = true)
     {
         var r = await Ffmpeg.RunAsync(Ffmpeg.FfprobePath!,
             new[] { "-v", "error", "-show_format", "-show_streams", "-of", "json", path }, ct);
@@ -83,6 +88,7 @@ static class Probe
         var tags = Tags(format);
         foreach (var kv in Tags(v)) tags.TryAdd(kv.Key, kv.Value);
         ReadSidecarAndTags(info, tags);
+        if (!frames) return info;
 
         info.FrameTimes = await FrameTimesAsync(path, ct);
         if (info.FrameTimes.Count == 0) throw new Exception("No video frames found.");
@@ -109,6 +115,8 @@ static class Probe
                     info.Start = dto;
                     info.FixedOffset = true;
                     info.StartSource = "Sony sidecar " + System.IO.Path.GetFileName(xml);
+                    info.MarksReason = "Sony's sidecar files date the start";
+                    info.MarksKnown = true;
                     found = true;
                 }
                 var dev = x.Descendants().FirstOrDefault(e => e.Name.LocalName == "Device");
@@ -125,17 +133,42 @@ static class Probe
             info.Start = a;
             info.FixedOffset = true;
             info.StartSource = "Apple creation date";
+            info.MarksReason = "Apple's creation date is the start";
+            info.MarksKnown = true;
             found = true;
         }
 
         // 3. Standard creation_time (UTC)
+        // (a file can carry the tag twice, which ffprobe reports joined by ";")
         if (!found && tags.TryGetValue("creation_time", out var ct)
-            && DateTimeOffset.TryParse(ct, Inv, DateTimeStyles.AssumeUniversal, out var u))
+            && DateTimeOffset.TryParse(ct.Split(';')[0], Inv, DateTimeStyles.AssumeUniversal, out var u))
         {
             info.Start = u.ToUniversalTime();
             info.FixedOffset = false;
             info.StartSource = "creation_time (UTC)";
+            // Android's recorder writes creation_time when recording stops; other devices stamp the start
+            info.DateMarksEnd = tags.Keys.Any(k => k.StartsWith("com.android.", StringComparison.OrdinalIgnoreCase));
+            info.MarksReason = info.DateMarksEnd ? "Android phones date the end" : "most cameras date the start";
+            info.MarksKnown = info.DateMarksEnd;
             found = true;
+        }
+
+        // 4. No date inside the file: its modified time, which copying keeps (unlike "created",
+        //    which becomes the copy time) and which is normally when the device finished writing,
+        //    i.e. the end of the recording. Only an estimate, so it's flagged wherever it's shown.
+        if (!found)
+        {
+            try
+            {
+                info.Start = new DateTimeOffset(File.GetLastWriteTimeUtc(info.Path), TimeSpan.Zero);
+                info.FixedOffset = false;
+                info.StartSource = "the file's modified time (no date inside the file)";
+                info.DateMarksEnd = true;
+                info.MarksReason = "a file is last saved when recording stops";
+                info.DateFromFileTime = true;
+                found = true;
+            }
+            catch { }
         }
         info.HasDate = found;   // without one, a start time can still be set manually
 

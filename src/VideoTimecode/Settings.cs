@@ -6,7 +6,7 @@ namespace VideoTimecode;
 public enum OutputMode { Subs, Embed, Burn }
 public enum EdgeStyle { Outline, Box, Shadow, None }
 public enum StartTimeMode { FromFile, Shifted, Manual }
-public enum CreationMarks { Start, End }
+public enum CreationMarks { Auto, Start, End }
 public enum CodecChoice { MatchSource, H264, Hevc, Av1 }
 public enum QualityChoice { MatchSource, Higher, Smaller }
 
@@ -56,7 +56,7 @@ public sealed class AppSettings
     public int BoxOpacity { get; set; } = 60;
 
     public string DateFormat { get; set; } = "yyyy-MM-dd HH:mm:ss.fff";
-    public CreationMarks CreationMarks { get; set; } = CreationMarks.Start;
+    public CreationMarks CreationMarks { get; set; } = CreationMarks.Auto;
     public string TimeZoneId { get; set; } = "";   // empty = automatic
 
     // Where the first frame's time comes from: the file, the file plus a correction, or typed in
@@ -141,7 +141,7 @@ public sealed class AppSettings
             if (r.TryGetProperty("Bold", out var b) && b.ValueKind is JsonValueKind.True or JsonValueKind.False) s.Bold = b.GetBoolean();
             s.EdgeColor = Str("OutlineColor", s.EdgeColor);
             s.DateFormat = Str("Format", s.DateFormat);
-            s.CreationMarks = Str("CreationMarks", "Start") == "End" ? CreationMarks.End : CreationMarks.Start;
+            s.CreationMarks = Str("CreationMarks", "Start") == "End" ? CreationMarks.End : CreationMarks.Auto;
             s.TimeZoneId = Str("TimeZone", "");
 
             var o = s.Overlays[0];

@@ -53,6 +53,10 @@ sealed class MainForm : Form
     string? lastOutput;
     List<string> allFonts = new(), evenFonts = new();
     readonly Dictionary<Job, double> jobProgress = new();
+    readonly Dictionary<string, VideoInfo> infoCache = new(StringComparer.OrdinalIgnoreCase);   // quick looks at each file
+    readonly Dictionary<ListViewItem, (string Text, string Detail)> described = new();          // rows showing that look
+    static readonly Color WarnColor = Color.FromArgb(190, 90, 0);
+    readonly Label lblCheck = new() { AutoSize = true, ForeColor = WarnColor, Visible = false, Margin = new Padding(3, 4, 3, 3) };
 
     readonly ListView lvFiles = new() { View = View.Details, FullRowSelect = true, AllowDrop = true, HideSelection = false, ShowItemToolTips = true, Dock = DockStyle.Fill };
     readonly RadioButton rbSubs = new() { Text = "External subtitle file (.ass next to the video)  -  fastest; video untouched", AutoSize = true };
@@ -253,8 +257,8 @@ sealed class MainForm : Form
         fileButtons = Flow(
             Btn("Add files...", (_, _) => AddFilesDialog()),
             Btn("Add folder...", (_, _) => AddFolderDialog()),
-            Btn("Remove", (_, _) => { foreach (ListViewItem i in lvFiles.SelectedItems) lvFiles.Items.Remove(i); }, 80),
-            Btn("Clear", (_, _) => lvFiles.Items.Clear(), 70));
+            Btn("Remove", (_, _) => { foreach (ListViewItem i in lvFiles.SelectedItems) lvFiles.Items.Remove(i); CheckSettings(); }, 80),
+            Btn("Clear", (_, _) => { lvFiles.Items.Clear(); CheckSettings(); }, 70));
 
         var radios = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, AutoSize = true, WrapContents = false, Margin = new Padding(14, 0, 0, 0) };
         radios.Controls.AddRange(new Control[] { rbSubs, rbEmbed, rbBurn });
@@ -274,7 +278,9 @@ sealed class MainForm : Form
             "yyyy-MM-dd hh:mm:ss.fff tt", "MM/dd/yyyy hh:mm:ss.fff tt", "dd.MM.yyyy HH:mm:ss.fff", "ddd d MMM yyyy HH:mm:ss",
             "h:mm tt\\ndddd, MMMM d, yyyy", "h:mm:ss tt\\nMMMM d, yyyy", "dddd, MMMM d, yyyy  h:mm:ss tt",
         });
-        cbMarks.Items.AddRange(new object[] { "Start of recording  (verified on Sony FDR-AX43)", "End of recording" });
+        cbMarks.Items.AddRange(new object[] { "Automatic  (end for Android phones, else start)", "Start of recording", "End of recording" });
+        tips.SetToolTip(cbMarks, "Whether the date stored in the file is when recording started or stopped. Automatic goes by the recording format; " +
+            "the file list shows what it found for each video.");
         cbZone.Items.Add(new Choice("Automatic  (camera's own offset if recorded, else this PC's zone)", ""));
         foreach (var z in TimeZoneInfo.GetSystemTimeZones()) cbZone.Items.Add(new Choice(z.DisplayName, z.Id));
         cbStartMode.Items.AddRange(new object[] { "From the file", "From the file, shifted by", "Set manually" });
@@ -287,7 +293,8 @@ sealed class MainForm : Form
             ("Label format", Flow(cbFormat, Btn("Format help...", (_, _) => ShowFormatHelp(), 110))),
             ("Start time", startPanel),
             ("Embedded date is the", cbMarks),
-            ("Time zone", cbZone));
+            ("Time zone", cbZone),
+            ("", lblCheck));
 
         return Column(
             (Header("1. Videos  (drop files or folders here)"), 0),
@@ -430,7 +437,7 @@ sealed class MainForm : Form
         s.EdgeColor = edgeColor;
         s.BoxOpacity = (int)numOpacity.Value;
         s.DateFormat = cbFormat.Text;
-        s.CreationMarks = cbMarks.SelectedIndex == 1 ? CreationMarks.End : CreationMarks.Start;
+        s.CreationMarks = (CreationMarks)Math.Max(0, cbMarks.SelectedIndex);
         s.TimeZoneId = (cbZone.SelectedItem as Choice)?.Value ?? "";
         s.StartMode = (StartTimeMode)Math.Max(0, cbStartMode.SelectedIndex);
         if (TemplateContext.TryParseShift(tbShift.Text, out var shift)) s.StartShiftSeconds = shift;
@@ -627,15 +634,17 @@ sealed class MainForm : Form
         chkBold.CheckedChanged += (_, _) => preview.Invalidate();
         chkEven.CheckedChanged += (_, _) => FillFonts();
         cbEdge.SelectedIndexChanged += (_, _) => { preview.Invalidate(); grid.Invalidate(); };
-        cbStartMode.SelectedIndexChanged += (_, _) => { UpdateStartControls(); preview.Invalidate(); };
+        cbStartMode.SelectedIndexChanged += (_, _) => { UpdateStartControls(); preview.Invalidate(); CheckSettings(); };
+        cbMarks.SelectedIndexChanged += (_, _) => CheckSettings();
         tbShift.TextChanged += (_, _) =>
         {
             tbShift.BackColor = TemplateContext.TryParseShift(tbShift.Text, out _) ? SystemColors.Window : Color.MistyRose;
+            CheckSettings();
             preview.Invalidate();
         };
         dtpStart.ValueChanged += (_, _) => preview.Invalidate();
         numStartMs.ValueChanged += (_, _) => preview.Invalidate();
-        cbZone.SelectedIndexChanged += (_, _) => preview.Invalidate();
+        cbZone.SelectedIndexChanged += (_, _) => { preview.Invalidate(); CheckSettings(); };
         numOpacity.ValueChanged += (_, _) => preview.Invalidate();
         cbFormat.TextChanged += (_, _) => preview.Invalidate();
         btnEdgeColor.Click += (_, _) =>
@@ -707,6 +716,7 @@ sealed class MainForm : Form
             return;
         }
         preview.Invalidate();   // FFmpeg is available now; GIF pictures redraw with their transparency
+        DescribeFiles(lvFiles.Items.Cast<ListViewItem>().ToList());
         await DetectEncodersAsync();
         if (quickRun) await RunAsync(fromSetup: true);
     }
@@ -880,6 +890,14 @@ sealed class MainForm : Form
         if (!Ffmpeg.Ready && !Ffmpeg.Locate() && !await DownloadFfmpegAsync()) return;
         if (workers == null) await DetectEncodersAsync();
 
+        // Settings that probably don't suit these videos: ask first (a quick run just logs them)
+        var issues = await CheckBeforeRunAsync(s);
+        if (issues.Count > 0 && !fromSetup &&
+            MessageBox.Show(this, "Some time settings may not suit these videos:\n\n" +
+                string.Join("\n\n", issues.Take(6).Select(i => "- " + i.Message)) +
+                (issues.Count > 6 ? $"\n\n...and {issues.Count - 6} more." : "") + "\n\nRun anyway?",
+                "Video Timecode", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+
         try { s.Save(); } catch { }
         running = true;
         UpdateEnabled();
@@ -892,6 +910,7 @@ sealed class MainForm : Form
         var jobs = lvFiles.Items.Cast<ListViewItem>().Select(i => new Job((string)i.Tag!, i)).ToList();
         jobProgress.Clear();
         foreach (var w in workers!) w.Active = 0;
+        described.Clear();   // the rows show the run's progress from here
         foreach (ListViewItem i in lvFiles.Items) SetItem(i, "Queued", null);
 
         var sw = Stopwatch.StartNew();
@@ -902,6 +921,7 @@ sealed class MainForm : Form
             var logLock = new object();
             log.WriteLine($"Video Timecode {typeof(Program).Assembly.GetName().Version} - {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
             log.WriteLine($"FFmpeg {Ffmpeg.FfmpegPath} ({Ffmpeg.Source()})");
+            foreach (var i in issues) log.WriteLine("Warning: " + i.Message);
             log.WriteLine($"Mode {s.Mode}; codec {s.Codec}; quality {s.Quality}; ticked encoders: " +
                           (s.Encoders.Count == 0 ? "automatic" : string.Join(", ", s.Encoders)));
             foreach (var w in workers) log.WriteLine($"  encoder {w.Id}: {w.Name} [{string.Join(' ', w.Caps)}]");
@@ -965,6 +985,7 @@ sealed class MainForm : Form
 
     void AddPaths(IEnumerable<string> paths)
     {
+        var added = new List<ListViewItem>();
         var existing = new HashSet<string>(lvFiles.Items.Cast<ListViewItem>().Select(i => (string)i.Tag!), StringComparer.OrdinalIgnoreCase);
         foreach (var raw in paths)
         {
@@ -984,8 +1005,109 @@ sealed class MainForm : Form
                 var item = new ListViewItem(Path.GetFileName(f)) { Tag = f, ToolTipText = f, UseItemStyleForSubItems = false };
                 item.SubItems.Add("");
                 lvFiles.Items.Add(item);
+                added.Add(item);
             }
         }
+        if (added.Count > 0) DescribeFiles(added);
+    }
+
+    // A quick look at each newly added file: its camera, recording date, and whether that date
+    // marks the start or the end of the recording, shown in the Status column until a run
+    async void DescribeFiles(List<ListViewItem> items)
+    {
+        if (!Ffmpeg.Ready) return;   // setup describes them once FFmpeg is found
+        using var gate = new SemaphoreSlim(4);
+        await Task.WhenAll(items.Select(async item =>
+        {
+            await gate.WaitAsync();
+            VideoInfo? info = null;
+            string error = "";
+            try { info = await Probe.ReadAsync((string)item.Tag!, CancellationToken.None, frames: false); }
+            catch (Exception ex) { error = ex.Message; }
+            finally { gate.Release(); }
+            UI(() =>
+            {
+                if (running || item.ListView == null || item.SubItems.Count < 2 || item.SubItems[1].Text != "") return;
+                if (info == null)
+                {
+                    SetItem(item, error, Color.Firebrick);
+                    return;
+                }
+                infoCache[(string)item.Tag!] = info;
+                described[item] = DescribeFile(info);
+                CheckSettings();
+            });
+        }));
+    }
+
+    // Compares the time settings with what the files contain: marks the rows and the settings
+    // concerned in orange, and explains under the Time section
+    void CheckSettings()
+    {
+        if (running || timePanel == null) return;
+        var s = CurrentSettings();
+        var infos = lvFiles.Items.Cast<ListViewItem>().Select(i => infoCache.GetValueOrDefault((string)i.Tag!)).OfType<VideoInfo>().ToList();
+        var issues = SettingsCheck.Check(s, infos);
+
+        foreach (var (item, d) in described.ToList())
+        {
+            if (item.ListView == null) { described.Remove(item); continue; }
+            var mine = issues.Where(i => string.Equals(i.Path, (string)item.Tag!, StringComparison.OrdinalIgnoreCase)).ToList();
+            SetItem(item, mine.Count > 0 ? d.Text + "  -  " + string.Join("; ", mine.Select(i => i.Short)) : d.Text,
+                mine.Count > 0 ? WarnColor : SystemColors.GrayText);
+            item.ToolTipText = (string)item.Tag! + "\n" + d.Detail + string.Concat(mine.Select(i => "\n" + i.Message));
+        }
+
+        foreach (var (target, text) in new[] { (CheckTarget.StartTime, "Start time"), (CheckTarget.Marks, "Embedded date is the"), (CheckTarget.TimeZone, "Time zone") })
+            foreach (var l in timePanel.Controls.OfType<Label>().Where(l => l.Text == text))
+                l.ForeColor = issues.Any(i => i.Target == target) ? WarnColor : SystemColors.ControlText;
+
+        // One short line per kind of problem (videos with the same one share it); the full
+        // explanations are in the tooltip, and on each file's row
+        string Line(IGrouping<(CheckTarget, string), CheckIssue> g) =>
+            g.First().Path == null ? g.First().Message
+            : g.Count() == 1 ? $"{Path.GetFileName(g.First().Path)}: {g.Key.Item2}"
+            : $"{g.Count()} videos: {g.Key.Item2}";
+        var lines = issues.GroupBy(i => (i.Target, i.Short)).Select(Line).ToList();
+        lblCheck.Text = string.Join("\n", lines.Take(3).Select(l => "! " + l)) +
+                        (lines.Count > 3 ? $"\n...and {lines.Count - 3} more" : "") + (lines.Count > 0 ? "  (point here for details)" : "");
+        lblCheck.Visible = lines.Count > 0;
+        tips.SetToolTip(lblCheck, string.Join("\n\n", issues.Select(i => i.Message)));
+    }
+
+    // The check for every file in the list, reading any not looked at yet
+    async Task<List<CheckIssue>> CheckBeforeRunAsync(AppSettings s)
+    {
+        var paths = lvFiles.Items.Cast<ListViewItem>().Select(i => (string)i.Tag!).ToList();
+        using var gate = new SemaphoreSlim(4);
+        await Task.WhenAll(paths.Where(p => !infoCache.ContainsKey(p)).Select(async p =>
+        {
+            await gate.WaitAsync();
+            try
+            {
+                var info = await Probe.ReadAsync(p, CancellationToken.None, frames: false);
+                lock (infoCache) infoCache[p] = info;
+            }
+            catch { }   // unreadable files fail in the run, with the reason
+            finally { gate.Release(); }
+        }));
+        return SettingsCheck.Check(s, paths.Select(p => infoCache.GetValueOrDefault(p)).OfType<VideoInfo>().ToList());
+    }
+
+    // Short text for the Status column, and the full story for the row's tooltip
+    static (string Text, string Detail) DescribeFile(VideoInfo v)
+    {
+        var camera = string.IsNullOrWhiteSpace(v.Camera) ? "" : v.Camera + "  -  ";
+        if (!v.HasDate) return (camera + "no date; set the start time manually", "No recording date in the file; set the start time manually under Time.");
+        var when = v.FixedOffset ? v.Start : v.Start.ToLocalTime();
+        if (v.DateFromFileTime)
+            return ($"{camera}{when:yyyy-MM-dd HH:mm:ss} (file's modified time)",
+                    $"No recording date inside the file, so its modified time ({when:yyyy-MM-dd HH:mm:ss zzz}) is used as the end of recording.\n" +
+                    "That is an estimate: copying usually keeps it, but editing the file changes it.");
+        var marks = v.DateMarksEnd ? "end" : "start";
+        return ($"{camera}{when:yyyy-MM-dd HH:mm:ss} ({marks})",
+                $"{v.Camera ?? "Unknown camera"}, recorded {when:yyyy-MM-dd HH:mm:ss zzz} (from {v.StartSource}).\n" +
+                $"With Embedded date is the: Automatic, this is taken as the {marks} of recording: {v.MarksReason}.");
     }
 
     void AddFilesDialog()

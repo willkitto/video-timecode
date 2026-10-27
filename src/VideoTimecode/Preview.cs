@@ -52,7 +52,7 @@ sealed class PreviewPanel : Control
             Codec = "h264",
             Fps = 29.97,
             Duration = 30.03,
-            Camera = "Sony FDR-AX43",
+            Camera = "Camera make and model",
             Gps = "37.77490, -122.41940",
             Timecode = "00:30:09;24",
             Start = DateTimeOffset.Now.AddSeconds(-4.07),

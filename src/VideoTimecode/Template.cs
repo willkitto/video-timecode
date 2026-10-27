@@ -42,11 +42,18 @@ sealed class TemplateContext
         {
             if (!info.HasDate)
                 throw new Exception("No recording date found in the file. Under Time, set the start time manually.");
-            T0 = settings.CreationMarks == CreationMarks.End
-                ? info.Start.AddTicks(-(long)Math.Round(ClipLength * 1e7))
-                : info.Start;
-            fixedOffset = info.FixedOffset;
-            StartSource = info.StartSource;
+            bool end = settings.CreationMarks switch
+            {
+                CreationMarks.End => true,
+                CreationMarks.Start => false,
+                _ => info.DateMarksEnd,
+            };
+            // Clip length to the millisecond, so a 5 s clip doesn't start at 59.999 from timestamp rounding
+            T0 = end ? info.Start.AddMilliseconds(-Math.Round(ClipLength * 1000)) : info.Start;
+            // A time zone chosen by hand overrides the offset the camera recorded
+            fixedOffset = info.FixedOffset && string.IsNullOrEmpty(settings.TimeZoneId);
+            StartSource = info.StartSource + (end ? ", end of recording" : ", start of recording") +
+                          (settings.CreationMarks == CreationMarks.Auto ? $" (automatic: {info.MarksReason})" : " (as chosen)");
             if (settings.StartMode == StartTimeMode.Shifted)
             {
                 T0 = T0.AddTicks((long)Math.Round(settings.StartShiftSeconds * 1e7));

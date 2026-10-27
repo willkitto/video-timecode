@@ -221,20 +221,44 @@ The app uses the first of these it finds:
 1. **Sony sidecar XML** (`<clip>M01.XML`): local time plus the camera's own UTC offset.
 2. **Apple** `com.apple.quicktime.creationdate`: local time plus offset.
 3. **`creation_time`** (UTC): converted using the Windows time zone rules for the recording date. This is the PC's zone unless you choose another one.
+4. **The file's modified time**, when the file stores no date at all (e.g. `.mpg`). It's taken as the end of the recording, since that's when the device last saved the file, and copying keeps it. (The file's *created* time isn't used: Windows sets it to when the file was copied.) It's only an estimate, so these files are marked in orange.
+
+A time zone chosen under *Time zone* also applies to files that record their own offset: their
+times are converted to it. *Automatic* keeps each camera's own time.
 
 Frame times are read from the file itself, so variable-frame-rate phone video stays accurate.
 
-**Start or end of recording?** Most files store the time recording *started*, but not every
-device does. On the Sony FDR-AX43 the embedded date is the start: the camera writes the
-thumbnail when recording begins and the XML when it stops, and the embedded time matches
-the thumbnail. If your device stamps the end, choose *End of recording*. To check a new
-device, film a clock that shows seconds and compare it with the timecode.
+**Start or end of recording?** *Embedded date is the* decides whether the stored date marks
+when recording started or stopped. **Automatic** (the default) goes by the recording format:
+
+| Date found in | Marks the | Why |
+|---|---|---|
+| Sony sidecar XML | start | Sony writes it when recording begins |
+| Apple creation date | start | iPhones and other Apple devices stamp the start |
+| `creation_time` from an Android phone (the file has `com.android.*` tags) | end | Android's recorder writes it when recording stops |
+| `creation_time` from anything else | start | what cameras usually do |
+
+As soon as videos are added, the file list shows each one's camera, recording date and which
+end that date was taken as, so you can check before running. If a device gets it wrong,
+choose *Start of recording* or *End of recording* instead. To check a new device, film a clock
+that shows seconds and compare it with the timecode.
 
 **Start time** under *Time* overrides the file:
 
 - **From the file:** as above.
 - **From the file, shifted by** `+h:mm:ss` or `-h:mm:ss`: corrects a camera clock that was set wrong, e.g. `-1:00:00` if it was an hour fast. It applies to every video in the batch.
 - **Set manually:** the date and time of the first frame (to the millisecond), in the chosen time zone. This also works for files that store no date, such as `.mpg`.
+
+**Checking the settings against the videos.** The time settings are checked against the
+videos in the list as you change them. Anything that looks wrong turns orange: the video's row
+(hover over it for the full explanation), the setting concerned, and a short note under *Time*.
+Run asks before going ahead. It flags:
+
+- a video with no date inside, using its modified time instead;
+- a date before 2001 or in the future (the camera's clock was probably never set);
+- *Start* or *End of recording* chosen when the video's format is known to store the other one;
+- a chosen time zone that differs from the offset the camera recorded;
+- a manual start time with several videos, which would all start at the same time.
 
 ## Command line
 
@@ -253,7 +277,7 @@ VideoTimecode.exe [--use-saved | --preset "Name"] [--exit-when-done] [files or f
 - **SmartScreen warns about the exe or `.bat`.** The app isn't code-signed. Choose *More info → Run anyway*, or right-click the zip → *Properties* → *Unblock* before extracting.
 - **A video failed.** Click **Open log** at the bottom of the window. It lists the exact ffmpeg command and error for each file.
 - **A GPU isn't listed, or isn't used.** Click **Diagnostics...** (see [When a GPU is missing](#when-a-gpu-is-missing-diagnostics)) and send the `diagnostics.txt` it saves.
-- **"No recording date found".** Some formats (e.g. `.mpg`) don't store one.
+- **A video is marked "file's modified time".** Its format (e.g. `.mpg`) stores no recording date, so the file's modified time is used as the end of recording. If that's off, set the start time manually.
 - **Timecode is an hour off.** Check the *Time zone* setting, and that the camera clock was set correctly.
 
 ## Building from source
