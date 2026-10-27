@@ -101,7 +101,8 @@ static class EncoderCaps
     {
         var gpus = Gpus();
         var ff = new FileInfo(Ffmpeg.FfmpegPath!);
-        var key = $"3|{ff.FullName}|{ff.Length}|{ff.LastWriteTimeUtc.Ticks}|" +
+        // (Windows' per-app GPU preference reorders the adapters FFmpeg sees, so it's part of the key)
+        var key = $"4|{ff.FullName}|{ff.Length}|{ff.LastWriteTimeUtc.Ticks}|{GpuPreference(ff.FullName)}|" +
                   string.Join(";", gpus.Select(g => $"{g.PnpId}|{g.DriverVersion}|{g.ErrorCode}"));
         LastError = null;
         try
@@ -134,8 +135,9 @@ static class EncoderCaps
                 continue;
             }
 
-            // The GPUs to try: NVENC numbers NVIDIA GPUs itself; AMD and Intel GPUs are picked
-            // by adapter, but only when there are several (with one, the default needs no picking)
+            // The GPUs to try: NVENC numbers NVIDIA GPUs itself; AMD and Intel GPUs are always opened
+            // by adapter, since FFmpeg's default adapter is whichever Windows lists first (often an
+            // NVIDIA card, which AMF then fails on). Only when the adapters couldn't be listed is the default tried.
             var devices = new List<(int Index, string Name, string[] Args, string Label)>();
             if (hw.Vendor == Vendor.Nvidia)
             {
@@ -148,8 +150,13 @@ static class EncoderCaps
             else
             {
                 var ads = d.Adapters.Where(a => VendorOf(a.VendorId) == hw.Vendor).ToList();
-                if (ads.Count > 1)
+                if (ads.Count > 0)
                     foreach (var a in ads) devices.Add((a.Index, a.Name, DeviceArgs(hw.Vendor, a.Index), $"adapter {a.Index}"));
+                else if (d.Adapters.Count > 0 && !gpus.Any(g => g.Vendor == hw.Vendor))
+                {
+                    d.Tests.Add(new EncoderTest { Encoder = $"*_{hw.Suffix}", Code = -1, Error = $"Not tested: no {hw.Vendor} GPU on this PC." });
+                    continue;
+                }
                 else
                     devices.Add((ads.FirstOrDefault()?.Index ?? 0,
                         ads.FirstOrDefault()?.Name ?? gpus.FirstOrDefault(g => g.Vendor == hw.Vendor)?.Name ?? $"{hw.Vendor} GPU",
@@ -173,7 +180,7 @@ static class EncoderCaps
 
                 workers.Add(new Worker
                 {
-                    Id = hw.Vendor == Vendor.Nvidia ? $"nvenc:{dev.Index}" : dev.Args.Length > 0 ? $"{hw.Suffix}:{dev.Index}" : hw.Suffix,
+                    Id = hw.Vendor == Vendor.Nvidia ? $"nvenc:{dev.Index}" : devices.Count > 1 ? $"{hw.Suffix}:{dev.Index}" : hw.Suffix,
                     Name = $"{dev.Name} ({hw.Label})",
                     Vendor = hw.Vendor,
                     GpuIndex = dev.Index,
@@ -183,6 +190,11 @@ static class EncoderCaps
                 });
             }
         }
+
+        // Identical cards get numbered, so they can be told apart in the list
+        foreach (var same in workers.GroupBy(w => w.Name).Where(g => g.Count() > 1))
+            foreach (var (w, i) in same.Select((w, i) => (w, i)))
+                w.Name = w.Name.Insert(w.Name.LastIndexOf(" (", StringComparison.Ordinal), $" #{i + 1}");
 
         // The CPU only claims what this FFmpeg build can actually encode
         var cpu = Cpu();
@@ -198,6 +210,17 @@ static class EncoderCaps
         }
         catch { }
         return workers;
+    }
+
+    // Windows' "Graphics settings" choice for an exe ("GpuPreference=1;" etc.), or "" if none
+    static string GpuPreference(string exe)
+    {
+        try
+        {
+            using var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\DirectX\UserGpuPreferences");
+            return k?.GetValue(exe) as string ?? "";
+        }
+        catch { return ""; }
     }
 
     // Arguments that open one particular AMD or Intel GPU (adapter numbers as Direct3D 11 counts them).
@@ -383,7 +406,7 @@ static class EncodePlan
     {
         // Hardware decoding where possible; ffmpeg falls back to software for formats the GPU can't decode
         Vendor.Nvidia => new() { "-hwaccel", "cuda", "-hwaccel_device", w.GpuIndex.ToString() },
-        // One of several AMD or Intel GPUs: open that one, decode on it, and the encoder uses it too
+        // The chosen AMD or Intel GPU: open that one, decode on it, and the encoder uses it too
         Vendor.Intel or Vendor.Amd when w.DeviceArgs.Count > 0 =>
             w.DeviceArgs.Concat(new[] { "-hwaccel", "d3d11va", "-hwaccel_device", "vtcd" }).ToList(),
         Vendor.Intel or Vendor.Amd => new() { "-hwaccel", "d3d11va" },

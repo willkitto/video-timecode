@@ -93,7 +93,7 @@ Everything lives in `%LOCALAPPDATA%\VideoTimecode` (for example
 |---|---|
 | `settings.json` | Last run's settings, written each time you click Run |
 | `presets\<name>.json` | One file per preset. Copy these to another PC to share presets. |
-| `encoders.json` | Which GPU encoders this PC has, with every test result (re-checked when the GPUs, their drivers or FFmpeg change) |
+| `encoders.json` | Which GPU encoders this PC has, with every test result (re-checked when the GPUs, their drivers, FFmpeg or its Windows *Graphics settings* preference change) |
 | `last-run.log`, `error.log` | Details of the last run, and of any unexpected errors |
 | `diagnostics.txt` | The last report from **Diagnostics...**, to send when asking for help |
 | `ffmpeg\` | FFmpeg, if the app downloaded it |
@@ -189,8 +189,10 @@ without support for it), the file is marked as failed, with a suggestion to tick
 encoder, instead of quietly using one you didn't pick. *Parallel jobs* sets how many videos
 run at once.
 
-PCs with two AMD or two Intel GPUs (for example a Ryzen laptop's built-in Radeon plus a
-discrete Radeon) get one entry per GPU, each tested and used separately.
+PCs with several GPUs get one entry per GPU, each tested and used separately (identical
+cards are numbered, e.g. *#1* and *#2*). AMD and Intel GPUs are always opened by number, so
+an AMD GPU works alongside NVIDIA cards that Windows lists ahead of it, with no need to change
+Windows' *Graphics settings* for FFmpeg.
 
 ### When a GPU is missing: Diagnostics
 

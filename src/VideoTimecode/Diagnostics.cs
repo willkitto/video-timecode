@@ -89,8 +89,11 @@ static class Diagnostics
             foreach (var t in det.Tests.OrderBy(t => t.Encoder.Split('_').Last()).ThenBy(t => t.Device).ThenBy(t => t.Encoder).ThenBy(t => t.Format))
             {
                 bool ok = t.Result != "" && t.Error == "";
-                Line($"    {(ok ? "OK  " : "FAIL")}  {t.Encoder,-11} {t.Format,-12} {t.Device,-10} {t.Seconds,5:0.0}s" +
-                     (ok ? "" : $"  exit {t.Code}: {t.Error}"));
+                if (t.Error.StartsWith("Not tested"))
+                    Line($"    SKIP  {t.Encoder,-11} {t.Error}");
+                else
+                    Line($"    {(ok ? "OK  " : "FAIL")}  {t.Encoder,-11} {t.Format,-12} {t.Device,-10} {t.Seconds,5:0.0}s" +
+                         (ok ? "" : $"  exit {t.Code}: {t.Error}"));
             }
         }
 
@@ -125,9 +128,16 @@ static class Diagnostics
         if (Ffmpeg.Source().StartsWith("found on the PATH"))
             f.Add($"The app is using an FFmpeg installed separately ({Ffmpeg.FfmpegPath}), not its own copy. If GPUs are missing, " +
                   "click Re-download FFmpeg: the app's own copy includes the NVIDIA, AMD and Intel encoders and is used ahead of the PATH.");
-        foreach (var (flag, what) in new[] { ("nvenc", "NVIDIA"), ("amf", "AMD"), ("libvpl", "Intel") })
-            if (ff.Flags.TryGetValue(flag, out var on) && !on && !(flag == "libvpl" && ff.Flags.GetValueOrDefault("libmfx")))
-                f.Add($"This FFmpeg was built without {what} encoder support ({flag}). Click Re-download FFmpeg to get a build that has it.");
+        // The encoder list is the real answer; the configure flags only stand in when it's missing
+        // (builds get NVENC from --enable-ffnvcodec, often with no --enable-nvenc at all)
+        foreach (var (suffix, flag, what) in new[] { ("nvenc", "ffnvcodec", "NVIDIA"), ("amf", "amf", "AMD"), ("qsv", "libvpl", "Intel") })
+        {
+            bool missing = det?.BuiltEncoders.Count > 0
+                ? !det.BuiltEncoders.Any(e => e.EndsWith("_" + suffix, StringComparison.Ordinal))
+                : ff.Flags.TryGetValue(flag, out var on) && !on && !(flag == "libvpl" && ff.Flags.GetValueOrDefault("libmfx"));
+            if (missing)
+                f.Add($"This FFmpeg was built without {what} encoder support ({suffix}). Click Re-download FFmpeg to get a build that has it.");
+        }
 
         foreach (var g in gpus)
         {
@@ -188,7 +198,10 @@ static class Diagnostics
         else if (err.Contains("unsupported device", StringComparison.OrdinalIgnoreCase))
             yield return "This NVIDIA GPU is too old for this FFmpeg's NVENC.";
 
-        if (err.Contains("amfrt64.dll", StringComparison.OrdinalIgnoreCase))
+        if (err.Contains("AMF failed to initialise on the given D3D11 device", StringComparison.OrdinalIgnoreCase))
+            yield return "AMF was handed a graphics device that isn't the AMD GPU (usually an NVIDIA one that Windows lists first). " +
+                         "Click Re-check GPUs: the app then opens the AMD GPU itself.";
+        else if (err.Contains("amfrt64.dll", StringComparison.OrdinalIgnoreCase))
             yield return "AMD's encoder runtime (amfrt64.dll, part of the AMD Adrenalin driver) isn't installed. Install the full driver from amd.com/support; Windows Update's driver often leaves it out.";
         else if (Regex.IsMatch(err, @"\bAMF\b.*(not supported|failed|version)|AMF_", RegexOptions.IgnoreCase))
             yield return "AMD's encoder (AMF) refused. The AMD driver may be too old: update it from amd.com/support, then click Re-check GPUs.";
@@ -221,7 +234,7 @@ static class Diagnostics
             info.Version = lines.FirstOrDefault() ?? "";
             var config = lines.FirstOrDefault(l => l.StartsWith("configuration:", StringComparison.Ordinal)) ?? "";
             if (config != "")
-                foreach (var flag in new[] { "nvenc", "ffnvcodec", "cuda-llvm", "amf", "libvpl", "libmfx", "d3d11va", "libx264", "libx265", "libsvtav1", "libass" })
+                foreach (var flag in new[] { "ffnvcodec", "cuda-llvm", "amf", "libvpl", "libmfx", "libx264", "libx265", "libsvtav1", "libass" })
                     info.Flags[flag] = config.Contains("--enable-" + flag);
             var h = await Ffmpeg.RunAsync(Ffmpeg.FfmpegPath, new[] { "-hide_banner", "-hwaccels" }, ct, TimeSpan.FromSeconds(20));
             info.HwAccels = h.Stdout.Split('\n').Select(l => l.Trim()).Where(l => l.Length > 0 && !l.EndsWith(':')).ToList();
