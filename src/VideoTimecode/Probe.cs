@@ -17,6 +17,7 @@ sealed class VideoInfo
     public List<double> FrameTimes = new();
 
     public DateTimeOffset Start;
+    public bool HasDate;                    // a recording date was found in the file
     public bool FixedOffset;                // Start already carries the camera's own UTC offset
     public string StartSource = "";
 
@@ -136,7 +137,7 @@ static class Probe
             info.StartSource = "creation_time (UTC)";
             found = true;
         }
-        if (!found) throw new Exception("No recording date found in the file.");
+        info.HasDate = found;   // without one, a start time can still be set manually
 
         info.Camera ??= JoinNonEmpty(
                             Get(tags, "com.apple.quicktime.make") ?? Get(tags, "com.android.manufacturer") ?? Get(tags, "make"),

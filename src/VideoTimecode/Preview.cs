@@ -3,7 +3,7 @@ using System.Drawing.Text;
 
 namespace VideoTimecode;
 
-// Draws the overlays on a sample 16:9 frame, laid out the way the .ass file lays them out
+// Draws the overlays on a sample 16:9 frame, using the same layout and font sizing as the .ass file
 sealed class PreviewPanel : Control
 {
     public Func<AppSettings>? Settings;
@@ -27,9 +27,10 @@ sealed class PreviewPanel : Control
             Gps = "37.77490, -122.41940",
             Timecode = "00:30:09;24",
             Start = DateTimeOffset.Now.AddSeconds(-4.07),
+            HasDate = true,
             FixedOffset = true,
         };
-        return new TemplateContext(info, s, TimeZoneInfo.Local);
+        return new TemplateContext(info, s, string.IsNullOrEmpty(s.TimeZoneId) ? TimeZoneInfo.Local : TimeZoneInfo.FindSystemTimeZoneById(s.TimeZoneId));
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -49,93 +50,82 @@ sealed class PreviewPanel : Control
 
         var s = Settings?.Invoke();
         if (s == null || frame.Height < 10) return;
-        var ctx = SampleContext(s);
-        bool box = s.Edge == EdgeStyle.Box;
-        var edge = ColorUtil.Parse(s.EdgeColor);
-        var edgeColor = box ? Color.FromArgb((int)(255 * Math.Clamp(s.BoxOpacity, 0, 100) / 100.0), edge) : edge;
-        float margin = frame.Height / 30;
+        TemplateContext ctx;
+        try { ctx = SampleContext(s); }
+        catch { return; }
+        int alpha = (int)(255 * Math.Clamp(s.BoxOpacity, 0, 100) / 100.0);
 
-        // Each overlay can have its own font; cache the families used
-        var families = new Dictionary<string, FontFamily>(StringComparer.OrdinalIgnoreCase);
-        FontFamily FamilyOf(string name) => families.TryGetValue(name, out var f) ? f : families[name] = TryFamily(name);
-
-        try
+        foreach (var grp in s.Overlays.Where(o => o.Enabled && !string.IsNullOrWhiteSpace(o.Text)).GroupBy(o => o.Position))
         {
-            foreach (var grp in s.Overlays.Where(o => o.Enabled && !string.IsNullOrWhiteSpace(o.Text)).GroupBy(o => o.Position))
-                DrawGroup(g, grp, frame, margin, ctx, box, edgeColor, s, FamilyOf);
-        }
-        finally
-        {
-            foreach (var f in families.Values) f.Dispose();
-        }
-    }
-
-    static void DrawGroup(Graphics g, IGrouping<Anchor9, Overlay> grp, RectangleF frame, float margin, TemplateContext ctx,
-        bool box, Color edgeColor, AppSettings s, Func<string, FontFamily> familyOf)
-    {
-        int an = (int)grp.Key;
-        int col = (an - 1) % 3, row = (an - 1) / 3;   // col: 0 left 1 center 2 right; row: 0 bottom 1 middle 2 top
-        var lines = grp.SelectMany(o =>
-        {
-            float px = (float)(frame.Height * o.Size / 100);
-            var family = familyOf(o.FontName ?? s.FontName);
-            bool bold = o.Bold ?? s.Bold;
-            var style = bold && family.IsStyleAvailable(FontStyle.Bold) ? FontStyle.Bold
-                      : family.IsStyleAvailable(FontStyle.Regular) ? FontStyle.Regular : FontStyle.Bold;
-            return new Template(o.Text).Render(ctx, 122, 4.07).Replace("\r", "").Split('\n')
-                .Select(t => (Text: t, Px: px, Color: ColorUtil.Parse(o.Color), Family: family, Style: style));
-        }).ToList();
-
-        float total = lines.Sum(l => l.Px);
-        float y = row switch
-        {
-            2 => frame.Top + margin,
-            1 => frame.Top + (frame.Height - total) / 2,
-            _ => frame.Bottom - margin - total,
-        };
-
-        foreach (var (text, px, color, family, style) in lines)
-        {
-            if (text.Length > 0 && px >= 1)
+            var align = s.Alignments.GetValueOrDefault(grp.Key);
+            var rows = grp.Select(o =>
             {
-                // ASS font size is the full line height; GDI+ wants the em size
-                float em = px * family.GetEmHeight(style) / (family.GetCellAscent(style) + family.GetCellDescent(style));
-                using var path = new GraphicsPath();
-                path.AddString(text, family, (int)style, em, PointF.Empty, StringFormat.GenericTypographic);
-                var b = path.GetBounds();
-                float x = col switch
-                {
-                    0 => frame.Left + margin,
-                    1 => frame.Left + (frame.Width - b.Width) / 2,
-                    _ => frame.Right - margin - b.Width,
-                };
-                using var m = new Matrix();
-                m.Translate(x - b.X, y + (px - b.Height) / 2 - b.Y);
-                path.Transform(m);
+                double px = frame.Height * o.Size / 100;
+                var edge = o.Edge ?? s.Edge;
+                return (O: o, Text: new Template(o.Text).Render(ctx, 122, 4.07).Replace("\r", ""), Px: px,
+                        Font: o.FontName ?? s.FontName, Bold: o.Bold ?? s.Bold, Edge: edge,
+                        EdgeColor: ColorUtil.Parse(o.EdgeColor ?? s.EdgeColor), Pad: edge == EdgeStyle.Box ? Math.Max(1, px / 5) : 0);
+            }).ToList();
+            var sizes = rows.Select(r =>
+            {
+                var lines = r.Text.Split('\n');
+                return new RowSize(r.Px, lines.Length, r.Pad, lines.Max(l => FontMetrics.Width(l, r.Font, r.Bold, r.Px)));
+            }).ToList();
+            var places = OverlayLayout.Place(grp.Key, align, sizes, frame.Width, frame.Height);
 
-                float bord = box ? Math.Max(1, px / 5) : Math.Max(0.5f, px / 14);
-                if (box)
-                {
-                    var r = path.GetBounds();
-                    r.Inflate(bord, bord);
-                    using var br = new SolidBrush(edgeColor);
-                    g.FillRectangle(br, r);
-                }
-                else
-                {
-                    using var pen = new Pen(edgeColor, bord * 2) { LineJoin = LineJoin.Round };
-                    g.DrawPath(pen, path);
-                }
-                using var fill = new SolidBrush(color);
-                g.FillPath(fill, path);
+            for (int k = 0; k < rows.Count; k++)
+            {
+                var r = rows[k];
+                var p = places[k];
+                var lines = r.Text.Split('\n');
+                for (int li = 0; li < lines.Length; li++)
+                    DrawLine(g, lines[li], r.Font, r.Bold, r.Px, ColorUtil.Parse(r.O.Color), r.Edge, r.EdgeColor, alpha, r.Pad,
+                        frame.Left + p.X, frame.Top + p.Y + li * r.Px, p.An);
             }
-            y += px;
         }
     }
 
-    static FontFamily TryFamily(string name)
+    // One line of text whose line box starts at top; x is its left, centre or right per the anchor
+    static void DrawLine(Graphics g, string text, string font, bool bold, double px, Color color,
+        EdgeStyle edge, Color edgeColor, int alpha, double pad, double x, double top, int an)
     {
-        try { return new FontFamily(name); }
-        catch { return new FontFamily(GenericFontFamilies.SansSerif); }
+        if (text.Length == 0 || px < 1) return;
+        var m = FontMetrics.Get(font, bold);
+        float em = (float)(px / m.LineHeight);
+        using var f = FontMetrics.MakeFont(font, bold, em);
+        var family = f.FontFamily;
+        double width = FontMetrics.Width(text, font, bold, px);
+        double left = an switch { 7 => x, 8 => x - width / 2, _ => x - width };
+
+        // Put the baseline where the renderer would: the font's Windows ascent below the line top
+        double baseline = top + em * m.Ascent;
+        double cellAscent = em * family.GetCellAscent(f.Style) / (double)family.GetEmHeight(f.Style);
+        using var path = new GraphicsPath();
+        path.AddString(text, family, (int)f.Style, em, new PointF((float)left, (float)(baseline - cellAscent)), StringFormat.GenericTypographic);
+
+        float bord = (float)Math.Max(0.5, px / 14);
+        switch (edge)
+        {
+            case EdgeStyle.Box:
+                using (var br = new SolidBrush(Color.FromArgb(alpha, edgeColor)))
+                    g.FillRectangle(br, (float)(left - pad), (float)(top - pad), (float)(width + 2 * pad), (float)(px + 2 * pad));
+                break;
+            case EdgeStyle.Outline:
+                using (var pen = new Pen(edgeColor, bord * 2) { LineJoin = LineJoin.Round })
+                    g.DrawPath(pen, path);
+                break;
+            case EdgeStyle.Shadow:
+                using (var shadow = (GraphicsPath)path.Clone())
+                using (var mx = new Matrix())
+                using (var br = new SolidBrush(Color.FromArgb(alpha, edgeColor)))
+                {
+                    mx.Translate(bord, bord);
+                    shadow.Transform(mx);
+                    g.FillPath(br, shadow);
+                }
+                break;
+        }
+        using var fill = new SolidBrush(color);
+        g.FillPath(fill, path);
     }
 }

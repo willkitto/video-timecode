@@ -82,7 +82,7 @@ sealed class JobRunner
         AssWriter.Write(job.AssPath, ctx);
 
         var label = ctx.LocalAt(0);
-        log($"{job.Input}\n  date from {info.StartSource}; first frame {label.ToString("yyyy-MM-dd HH:mm:ss.fff zzz", CultureInfo.InvariantCulture)}; " +
+        log($"{job.Input}\n  date from {ctx.StartSource}; first frame {label.ToString("yyyy-MM-dd HH:mm:ss.fff zzz", CultureInfo.InvariantCulture)}; " +
             $"{info.Width}x{info.Height} {info.Codec} {info.PixFmt} {info.Fps:0.###} fps {info.VideoBitRate / 1000} kb/s, {ctx.Frames} frames");
 
         if (s.Mode == OutputMode.Burn)

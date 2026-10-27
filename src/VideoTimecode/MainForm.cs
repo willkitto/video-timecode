@@ -88,6 +88,17 @@ sealed class MainForm : Form
     // A down-pointing triangle; built from its code so the source stays plain ASCII
     static readonly string Arrow = "  " + (char)0x25BE;
 
+    // Indexed by EdgeStyle
+    static readonly string[] EdgeNames = { "Outline", "Box behind text", "Shadow", "None" };
+
+    readonly ComboBox cbStartMode = Drop(165);
+    readonly TextBox tbShift = new() { Width = 100, Text = "+0:00:00", Margin = new Padding(6, 3, 3, 3) };
+    readonly Label lblShiftHint = new() { Text = "h:mm:ss  (- for earlier)", AutoSize = true, Margin = new Padding(3, 7, 3, 3) };
+    readonly DateTimePicker dtpStart = new() { Format = DateTimePickerFormat.Custom, CustomFormat = "yyyy-MM-dd  h:mm:ss tt", Width = 180, Margin = new Padding(6, 3, 3, 3) };
+    readonly NumericUpDown numStartMs = new() { Maximum = 999, Width = 50 };
+    readonly Label lblMs = new() { Text = "ms", AutoSize = true, Margin = new Padding(3, 7, 3, 3) };
+    Control startPanel = null!;
+
     public MainForm(IEnumerable<string> paths, bool useSaved, string? preset, bool exitWhenDone)
     {
         settings = AppSettings.Load();
@@ -258,12 +269,16 @@ sealed class MainForm : Form
         {
             "yyyy-MM-dd HH:mm:ss.fff", "yyyy-MM-dd HH:mm:ss.ff", "yyyy-MM-dd HH:mm:ss", "HH:mm:ss.fff",
             "yyyy-MM-dd hh:mm:ss.fff tt", "MM/dd/yyyy hh:mm:ss.fff tt", "dd.MM.yyyy HH:mm:ss.fff", "ddd d MMM yyyy HH:mm:ss",
+            "h:mm tt\\ndddd, MMMM d, yyyy", "h:mm:ss tt\\nMMMM d, yyyy", "dddd, MMMM d, yyyy  h:mm:ss tt",
         });
         cbMarks.Items.AddRange(new object[] { "Start of recording  (verified on Sony FDR-AX43)", "End of recording" });
         cbZone.Items.Add(new Choice("Automatic  (camera's own offset if recorded, else this PC's zone)", ""));
         foreach (var z in TimeZoneInfo.GetSystemTimeZones()) cbZone.Items.Add(new Choice(z.DisplayName, z.Id));
+        cbStartMode.Items.AddRange(new object[] { "From the file", "From the file, shifted by", "Set manually" });
+        startPanel = Flow(cbStartMode, tbShift, lblShiftHint, dtpStart, numStartMs, lblMs);
         timePanel = FormTable(
-            ("Label format", Flow(cbFormat, Lbl("HH=24h  hh=12h  tt=AM/PM  fff=ms"))),
+            ("Label format", Flow(cbFormat, Btn("Format help...", (_, _) => ShowFormatHelp(), 110))),
+            ("Start time", startPanel),
             ("Embedded date is the", cbMarks),
             ("Time zone", cbZone));
 
@@ -300,10 +315,15 @@ sealed class MainForm : Form
                 Name = "Position", HeaderText = "Position", FillWeight = 22, FlatStyle = FlatStyle.Flat,
                 DefaultCellStyle = { Alignment = DataGridViewContentAlignment.MiddleLeft },
             },
-            new DataGridViewTextBoxColumn { Name = "Text", DataPropertyName = nameof(Overlay.Text), HeaderText = "Text  ({tokens} are filled in per frame)", FillWeight = 34 },
+            new DataGridViewTextBoxColumn { Name = "Text", DataPropertyName = nameof(Overlay.Text), HeaderText = "Text  ({tokens}; \\n = new line)", FillWeight = 30 },
             new DataGridViewButtonColumn
             {
-                Name = "Font", HeaderText = "Font", FillWeight = 23, FlatStyle = FlatStyle.Flat,
+                Name = "Font", HeaderText = "Font", FillWeight = 21, FlatStyle = FlatStyle.Flat,
+                DefaultCellStyle = { Alignment = DataGridViewContentAlignment.MiddleLeft },
+            },
+            new DataGridViewButtonColumn
+            {
+                Name = "Edge", HeaderText = "Edge", FillWeight = 15, FlatStyle = FlatStyle.Flat,
                 DefaultCellStyle = { Alignment = DataGridViewContentAlignment.MiddleLeft },
             },
             new DataGridViewTextBoxColumn { Name = "Size", DataPropertyName = nameof(Overlay.Size), HeaderText = "Size %", FillWeight = 9 },
@@ -325,10 +345,10 @@ sealed class MainForm : Form
             Btn("Move up", (_, _) => MoveOverlay(-1), 80),
             Btn("Move down", (_, _) => MoveOverlay(1), 85));
 
-        cbEdge.Items.AddRange(new object[] { "Outline", "Box behind text" });
+        cbEdge.Items.AddRange(EdgeNames);
         var style = FormTable(
             ("Default font", Flow(cbFont, chkBold, chkEven)),
-            ("Edge", Flow(cbEdge, btnEdgeColor, Lbl("Box opacity %"), numOpacity)));
+            ("Default edge", Flow(cbEdge, btnEdgeColor, Lbl("Box / shadow opacity %"), numOpacity)));
 
         return Column(
             (Header("3. Text overlays  (several per position stack in list order)"), 0),
@@ -376,6 +396,12 @@ sealed class MainForm : Form
         cbFormat.Text = settings.DateFormat;
         cbMarks.SelectedIndex = (int)settings.CreationMarks;
         cbZone.SelectedIndex = Math.Max(0, cbZone.Items.Cast<Choice>().ToList().FindIndex(c => c.Value == settings.TimeZoneId));
+        cbStartMode.SelectedIndex = (int)settings.StartMode;
+        tbShift.Text = TemplateContext.FormatShift(settings.StartShiftSeconds);
+        var manual = settings.ManualStart;
+        dtpStart.Value = manual < dtpStart.MinDate || manual > dtpStart.MaxDate ? DateTime.Today.AddHours(12) : manual.AddMilliseconds(-manual.Millisecond);
+        numStartMs.Value = manual.Millisecond;
+        UpdateStartControls();
         preview.Settings = CurrentSettings;
         UpdateEnabled();
     }
@@ -393,6 +419,10 @@ sealed class MainForm : Form
         s.DateFormat = cbFormat.Text;
         s.CreationMarks = cbMarks.SelectedIndex == 1 ? CreationMarks.End : CreationMarks.Start;
         s.TimeZoneId = (cbZone.SelectedItem as Choice)?.Value ?? "";
+        s.StartMode = (StartTimeMode)Math.Max(0, cbStartMode.SelectedIndex);
+        if (TemplateContext.TryParseShift(tbShift.Text, out var shift)) s.StartShiftSeconds = shift;
+        s.ManualStart = dtpStart.Value.Date + dtpStart.Value.TimeOfDay - TimeSpan.FromMilliseconds(dtpStart.Value.Millisecond)
+                        + TimeSpan.FromMilliseconds((double)numStartMs.Value);
         s.Codec = (CodecChoice)Math.Max(0, cbCodec.SelectedIndex);
         s.Quality = (QualityChoice)Math.Max(0, cbQuality.SelectedIndex);
         // Keep ticks for encoders this PC doesn't have (e.g. a preset from another PC) until we know
@@ -479,7 +509,9 @@ sealed class MainForm : Form
             if (e.RowIndex >= 0 && e.RowIndex < overlays.Count && grid.Columns[e.ColumnIndex].Name == "Position")
             {
                 var pos = overlays[e.RowIndex].Position;
-                e.Value = (Positions.FirstOrDefault(p => p.Value == pos)?.Name ?? pos.ToString()) + "  \u25BE";
+                var align = settings.Alignments.GetValueOrDefault(pos);
+                e.Value = (Positions.FirstOrDefault(p => p.Value == pos)?.Name ?? pos.ToString())
+                          + (align == RowAlign.Auto ? "" : $" ({ShortAlignNames[(int)align]})") + Arrow;
                 e.FormattingApplied = true;
             }
             if (e.RowIndex >= 0 && e.RowIndex < overlays.Count && grid.Columns[e.ColumnIndex].Name == "Font")
@@ -487,7 +519,14 @@ sealed class MainForm : Form
                 var o = overlays[e.RowIndex];
                 e.Value = (o.FontName ?? "Default") + (o.Bold == true ? " Bold" : o.Bold == false && o.FontName == null ? " Regular" : "") + Arrow;
                 if (e.CellStyle != null)
-                    e.CellStyle.ForeColor = e.CellStyle.SelectionForeColor = MayWobble(o) ? Color.DarkOrange : SystemColors.ControlText;
+                    e.CellStyle.ForeColor = e.CellStyle.SelectionForeColor = FontWarning(o) != null ? Color.DarkOrange : SystemColors.ControlText;
+                e.FormattingApplied = true;
+            }
+            if (e.RowIndex >= 0 && e.RowIndex < overlays.Count && grid.Columns[e.ColumnIndex].Name == "Edge")
+            {
+                var o = overlays[e.RowIndex];
+                e.Value = (o.Edge is { } edge ? EdgeNames[(int)edge].Replace(" behind text", "") : "Default")
+                          + (o.EdgeColor != null ? " " + ColorUtil.ToHex(ColorUtil.Parse(o.EdgeColor)) : "") + Arrow;
                 e.FormattingApplied = true;
             }
             if (e.RowIndex >= 0 && grid.Columns[e.ColumnIndex].Name == "Color" && e.CellStyle != null)
@@ -500,8 +539,8 @@ sealed class MainForm : Form
         grid.CellToolTipTextNeeded += (_, e) =>
         {
             if (e.RowIndex < 0 || e.RowIndex >= overlays.Count || grid.Columns[e.ColumnIndex].Name != "Font") return;
-            e.ToolTipText = MayWobble(overlays[e.RowIndex])
-                ? "This font's digits have different widths, so changing numbers may wobble. Click to choose another font."
+            e.ToolTipText = FontWarning(overlays[e.RowIndex]) is { } warning
+                ? warning + " Click to choose another font."
                 : "Click to choose a font for this overlay.";
         };
         // Any click in the cell (CellContentClick misses some clicks), or Space/Enter
@@ -515,7 +554,16 @@ sealed class MainForm : Form
         cbFont.SelectedIndexChanged += (_, _) => { preview.Invalidate(); grid.Invalidate(); };
         chkBold.CheckedChanged += (_, _) => preview.Invalidate();
         chkEven.CheckedChanged += (_, _) => FillFonts();
-        cbEdge.SelectedIndexChanged += (_, _) => { numOpacity.Enabled = cbEdge.SelectedIndex == 1; preview.Invalidate(); };
+        cbEdge.SelectedIndexChanged += (_, _) => { preview.Invalidate(); grid.Invalidate(); };
+        cbStartMode.SelectedIndexChanged += (_, _) => { UpdateStartControls(); preview.Invalidate(); };
+        tbShift.TextChanged += (_, _) =>
+        {
+            tbShift.BackColor = TemplateContext.TryParseShift(tbShift.Text, out _) ? SystemColors.Window : Color.MistyRose;
+            preview.Invalidate();
+        };
+        dtpStart.ValueChanged += (_, _) => preview.Invalidate();
+        numStartMs.ValueChanged += (_, _) => preview.Invalidate();
+        cbZone.SelectedIndexChanged += (_, _) => preview.Invalidate();
         numOpacity.ValueChanged += (_, _) => preview.Invalidate();
         cbFormat.TextChanged += (_, _) => preview.Invalidate();
         btnEdgeColor.Click += (_, _) =>
@@ -527,7 +575,6 @@ sealed class MainForm : Form
                 preview.Invalidate();
             }
         };
-        numOpacity.Enabled = cbEdge.SelectedIndex == 1;
 
         btnRun.Click += async (_, _) => await RunAsync(fromSetup: false);
         btnCancel.Click += (_, _) => { if (running) cts?.Cancel(); else Close(); };
@@ -649,7 +696,8 @@ sealed class MainForm : Form
             var names = new InstalledFontCollection().Families.Select(f => f.Name).ToList();
             using var bmp = new Bitmap(1, 1);
             using var g = Graphics.FromImage(bmp);
-            var evenNames = names.Where(n => EvenDigits(g, n)).ToList();
+            // Fonts with very tall lines (e.g. Cambria Math) render tiny, so leave them out of the quick list
+            var evenNames = names.Where(n => EvenDigits(g, n) && FontMetrics.Get(n, false).LineHeight <= FontMetrics.TallLineHeight).ToList();
             return (names, evenNames);
         });
         allFonts = all;
@@ -714,6 +762,8 @@ sealed class MainForm : Form
         if (lvFiles.Items.Count == 0) { Warn("Add at least one video first."); return; }
         if (s.Mode == OutputMode.Burn && !chkAutoEncoders.Checked && chosenEncoders.Count == 0)
         { Warn("Tick at least one encoder, or choose Automatic."); return; }
+        if (s.StartMode == StartTimeMode.Shifted && !TemplateContext.TryParseShift(tbShift.Text, out _))
+        { Warn("Enter the shift as h:mm:ss, e.g. +1:00:00 or -0:00:12.5"); return; }
         if (!s.Overlays.Any(o => o.Enabled && !string.IsNullOrWhiteSpace(o.Text))) { Warn("Add at least one text overlay."); return; }
         try { _ = DateTime.Now.ToString(s.DateFormat, CultureInfo.InvariantCulture); }
         catch (FormatException) { Warn("The label format isn't a valid date format."); return; }
@@ -879,6 +929,9 @@ sealed class MainForm : Form
             case "Font":
                 BeginInvoke(() => ShowFontMenu(row, col));
                 return true;
+            case "Edge":
+                BeginInvoke(() => ShowEdgeMenu(row, col));
+                return true;
             case "Color":
                 var o = overlays[row];
                 if (PickColor(o.Color) is { } hex)
@@ -908,18 +961,152 @@ sealed class MainForm : Form
             };
             menu.Items.Add(item);
         }
+
+        // How the rows at this position line up with each other (applies to all of them)
+        var name = Positions.First(p => p.Value == o.Position).Name;
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(new ToolStripMenuItem($"Line up rows at {name.ToLowerInvariant()} by:") { Enabled = false });
+        var current = settings.Alignments.GetValueOrDefault(o.Position);
+        for (int i = 0; i < AlignNames.Length; i++)
+        {
+            var align = (RowAlign)i;
+            var item = new ToolStripMenuItem("    " + (align == RowAlign.Auto
+                ? $"Auto  ({AlignNames[(int)OverlayLayout.Effective(o.Position, RowAlign.Auto)].ToLowerInvariant()}, follows the position)"
+                : AlignNames[i]))
+            { Checked = align == current };
+            item.Click += (_, _) =>
+            {
+                if (align == RowAlign.Auto) settings.Alignments.Remove(o.Position);
+                else settings.Alignments[o.Position] = align;
+                grid.Invalidate();
+                preview.Invalidate();
+            };
+            menu.Items.Add(item);
+        }
+
         menu.Closed += (_, _) => BeginInvoke(menu.Dispose);
         var r = grid.GetCellDisplayRectangle(col, row, false);
         menu.Show(grid, new Point(r.Left, r.Bottom));
     }
 
+    // Indexed by RowAlign
+    static readonly string[] AlignNames = { "Auto", "Left edges", "Centers", "Right edges" };
+    static readonly string[] ShortAlignNames = { "", "left", "center", "right" };
+
+    void ShowEdgeMenu(int row, int col)
+    {
+        var o = overlays[row];
+        void Changed()
+        {
+            grid.InvalidateRow(row);
+            preview.Invalidate();
+        }
+
+        var menu = new ContextMenuStrip();
+        var def = new ToolStripMenuItem($"Default  ({EdgeNames[Math.Max(0, cbEdge.SelectedIndex)]}, from Style)") { Checked = o.Edge == null };
+        def.Click += (_, _) => { o.Edge = null; Changed(); };
+        menu.Items.Add(def);
+        for (int i = 0; i < EdgeNames.Length; i++)
+        {
+            var edge = (EdgeStyle)i;
+            var item = new ToolStripMenuItem(EdgeNames[i]) { Checked = o.Edge == edge };
+            item.Click += (_, _) => { o.Edge = edge; Changed(); };
+            menu.Items.Add(item);
+        }
+        menu.Items.Add(new ToolStripSeparator());
+        var pick = new ToolStripMenuItem("Edge color for this row...");
+        pick.Click += (_, _) => BeginInvoke(() =>
+        {
+            if (PickColor(o.EdgeColor ?? edgeColor) is { } hex) { o.EdgeColor = hex; Changed(); }
+        });
+        menu.Items.Add(pick);
+        var reset = new ToolStripMenuItem($"Use the Style edge color ({ColorUtil.ToHex(ColorUtil.Parse(edgeColor))})") { Enabled = o.EdgeColor != null };
+        reset.Click += (_, _) => { o.EdgeColor = null; Changed(); };
+        menu.Items.Add(reset);
+
+        menu.Closed += (_, _) => BeginInvoke(menu.Dispose);
+        var r = grid.GetCellDisplayRectangle(col, row, false);
+        menu.Show(grid, new Point(r.Left, r.Bottom));
+    }
+
+    void UpdateStartControls()
+    {
+        var mode = (StartTimeMode)Math.Max(0, cbStartMode.SelectedIndex);
+        tbShift.Visible = lblShiftHint.Visible = mode == StartTimeMode.Shifted;
+        dtpStart.Visible = numStartMs.Visible = lblMs.Visible = mode == StartTimeMode.Manual;
+        cbMarks.Enabled = mode != StartTimeMode.Manual;   // a typed-in time is always the first frame's
+    }
+
+    // Reference of date/time codes; double-click one to add it to the label format
+    void ShowFormatHelp()
+    {
+        var now = DateTimeOffset.Now;
+        (string Code, string Meaning)[] codes =
+        {
+            ("yyyy", "Year, 4 digits"), ("yy", "Year, 2 digits"),
+            ("MMMM", "Month name"), ("MMM", "Month name, short"), ("MM", "Month, 2 digits"), ("M", "Month"),
+            ("dddd", "Day of the week"), ("ddd", "Day of the week, short"), ("dd", "Day of the month, 2 digits"), ("d", "Day of the month"),
+            ("hh", "Hour, 12-hour clock, 2 digits"), ("h", "Hour, 12-hour clock"), ("HH", "Hour, 24-hour clock, 2 digits"), ("H", "Hour, 24-hour clock"),
+            ("mm", "Minutes, 2 digits"), ("m", "Minutes"), ("ss", "Seconds, 2 digits"), ("s", "Seconds"),
+            ("f", "Tenths of a second"), ("ff", "Hundredths of a second"), ("fff", "Milliseconds"),
+            ("ffff", "Ten-thousandths of a second (up to fffffff)"), ("FFF", "Milliseconds, trailing zeros dropped"),
+            ("tt", "AM / PM"), ("t", "A / P"),
+            ("zzz", "UTC offset, hours and minutes"), ("zz", "UTC offset, 2-digit hours"), ("z", "UTC offset, hours"),
+            ("g", "Era"),
+            ("\\n", "New line (Video Timecode)"), ("'text'", "Text shown as typed, e.g. 'at'"), ("\\x", "One character shown as typed, e.g. \\h"),
+        };
+        using var f = new Form
+        {
+            Text = "Date and time format codes", StartPosition = FormStartPosition.CenterParent, Font = Font,
+            ClientSize = new Size(LogicalToDeviceUnits(640), LogicalToDeviceUnits(720)),
+            MinimizeBox = false, ShowInTaskbar = false, Padding = new Padding(LogicalToDeviceUnits(10)),
+        };
+        var intro = new Label
+        {
+            Dock = DockStyle.Top, Height = LogicalToDeviceUnits(84),
+            Text = "Use these in Label format, or inside a token like {datetime:h:mm tt} or {date:dddd}. Letters are case-sensitive " +
+                   "(MM = month, mm = minutes). Spaces and : / - , . appear as typed. Names are in English.\n" +
+                   "Double-click a code to add it to Label format.",
+        };
+        var list = new ListView { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true };
+        list.Columns.Add("Code", LogicalToDeviceUnits(90));
+        list.Columns.Add("Meaning", LogicalToDeviceUnits(300));
+        list.Columns.Add("Now", LogicalToDeviceUnits(190));
+        foreach (var (code, meaning) in codes)
+        {
+            string example = code switch
+            {
+                "\\n" => "(line break)",
+                "'text'" => "text",
+                "\\x" => "x",
+                _ => Template.Fmt(now, code),
+            };
+            list.Items.Add(new ListViewItem(new[] { code, meaning, example }));
+        }
+        list.ItemActivate += (_, _) =>
+        {
+            if (list.SelectedItems.Count == 0) return;
+            var code = list.SelectedItems[0].Text;
+            int at = Math.Clamp(cbFormat.SelectionStart, 0, cbFormat.Text.Length);
+            cbFormat.Text = cbFormat.Text.Insert(at, code);
+            cbFormat.SelectionStart = at + code.Length;
+        };
+        f.Controls.Add(list);
+        f.Controls.Add(intro);
+        f.ShowDialog(this);
+    }
+
     string StyleFont => cbFont.SelectedItem as string ?? settings.FontName;
 
-    // True if this overlay changes per frame in a font whose digits differ in width
-    bool MayWobble(Overlay o)
+    // A problem with this overlay's font, or null
+    string? FontWarning(Overlay o)
     {
         var font = o.FontName ?? StyleFont;
-        return evenFonts.Count > 0 && allFonts.Contains(font) && !evenFonts.Contains(font) && new Template(o.Text).IsDynamic;
+        if (FontMetrics.Get(font, o.Bold ?? chkBold.Checked).LineHeight > FontMetrics.TallLineHeight)
+            return "This font reserves very tall lines, so its letters come out much smaller than the size you set.";
+        if (evenFonts.Count > 0 && allFonts.Contains(font) && !evenFonts.Contains(font) && new Template(o.Text).IsDynamic)
+            return "This font's digits have different widths, so changing numbers may wobble.";
+        return null;
     }
 
     void ShowFontMenu(int row, int col)

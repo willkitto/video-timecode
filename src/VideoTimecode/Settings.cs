@@ -4,7 +4,8 @@ using System.Text.Json.Serialization;
 namespace VideoTimecode;
 
 public enum OutputMode { Subs, Embed, Burn }
-public enum EdgeStyle { Outline, Box }
+public enum EdgeStyle { Outline, Box, Shadow, None }
+public enum StartTimeMode { FromFile, Shifted, Manual }
 public enum CreationMarks { Start, End }
 public enum CodecChoice { MatchSource, H264, Hevc, Av1 }
 public enum QualityChoice { MatchSource, Higher, Smaller }
@@ -29,6 +30,10 @@ public sealed class Overlay
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? FontName { get; set; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public bool? Bold { get; set; }
 
+    // Per-overlay edge; null uses the Style edge / edge colour
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public EdgeStyle? Edge { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string? EdgeColor { get; set; }
+
     public Overlay Clone() => (Overlay)MemberwiseClone();
 }
 
@@ -36,6 +41,9 @@ public sealed class AppSettings
 {
     public OutputMode Mode { get; set; } = OutputMode.Subs;
     public List<Overlay> Overlays { get; set; } = new() { new Overlay() };
+
+    // How rows line up at each position; positions not listed use Auto
+    public Dictionary<Anchor9, RowAlign> Alignments { get; set; } = new();
 
     public string FontName { get; set; } = "Consolas";
     public bool Bold { get; set; } = true;
@@ -46,6 +54,11 @@ public sealed class AppSettings
     public string DateFormat { get; set; } = "yyyy-MM-dd HH:mm:ss.fff";
     public CreationMarks CreationMarks { get; set; } = CreationMarks.Start;
     public string TimeZoneId { get; set; } = "";   // empty = automatic
+
+    // Where the first frame's time comes from: the file, the file plus a correction, or typed in
+    public StartTimeMode StartMode { get; set; } = StartTimeMode.FromFile;
+    public double StartShiftSeconds { get; set; }
+    public DateTime ManualStart { get; set; } = DateTime.Today.AddHours(12);   // wall-clock time in the time zone
 
     public CodecChoice Codec { get; set; } = CodecChoice.MatchSource;
     public QualityChoice Quality { get; set; } = QualityChoice.MatchSource;
@@ -104,6 +117,7 @@ public sealed class AppSettings
         var c = (AppSettings)MemberwiseClone();
         c.Overlays = Overlays.Select(o => o.Clone()).ToList();
         c.Encoders = new List<string>(Encoders);
+        c.Alignments = new Dictionary<Anchor9, RowAlign>(Alignments);
         return c;
     }
 

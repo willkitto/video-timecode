@@ -16,6 +16,8 @@ sealed class TemplateContext
     public long TcStart { get; }
     public int TcFps { get; }
     public bool TcDrop { get; }
+    public string StartSource { get; }
+    readonly bool fixedOffset;
 
     public TemplateContext(VideoInfo info, AppSettings settings, TimeZoneInfo zone)
     {
@@ -28,9 +30,29 @@ sealed class TemplateContext
         double frameDur = t.Count > 1 ? (t[^1] - t[0]) / (t.Count - 1) : 1 / Math.Max(1, info.Fps);
         ClipLength = t.Count > 0 ? t[^1] + frameDur - t[0] : info.Duration;
 
-        T0 = settings.CreationMarks == CreationMarks.End
-            ? info.Start.AddTicks(-(long)Math.Round(ClipLength * 1e7))
-            : info.Start;
+        if (settings.StartMode == StartTimeMode.Manual)
+        {
+            // Typed as a wall-clock time in the chosen zone; DST still applies as the clip runs
+            var local = DateTime.SpecifyKind(settings.ManualStart, DateTimeKind.Unspecified);
+            T0 = new DateTimeOffset(local, zone.GetUtcOffset(local));
+            fixedOffset = false;
+            StartSource = "set manually";
+        }
+        else
+        {
+            if (!info.HasDate)
+                throw new Exception("No recording date found in the file. Under Time, set the start time manually.");
+            T0 = settings.CreationMarks == CreationMarks.End
+                ? info.Start.AddTicks(-(long)Math.Round(ClipLength * 1e7))
+                : info.Start;
+            fixedOffset = info.FixedOffset;
+            StartSource = info.StartSource;
+            if (settings.StartMode == StartTimeMode.Shifted)
+            {
+                T0 = T0.AddTicks((long)Math.Round(settings.StartShiftSeconds * 1e7));
+                StartSource += $", shifted by {FormatShift(settings.StartShiftSeconds)}";
+            }
+        }
 
         Smpte.TryParse(info.Timecode, info.Fps, out var start, out var nominal, out var drop);
         TcStart = start;
@@ -43,7 +65,31 @@ sealed class TemplateContext
     public DateTimeOffset LocalAt(double rel)
     {
         var at = T0.AddTicks((long)Math.Round(rel * 1e7));
-        return Info.FixedOffset ? at : TimeZoneInfo.ConvertTime(at, Zone);
+        return fixedOffset ? at : TimeZoneInfo.ConvertTime(at, Zone);
+    }
+
+    // +h:mm:ss[.fff], e.g. "+1:00:00" or "-0:00:12.500"
+    public static string FormatShift(double seconds)
+    {
+        var ts = TimeSpan.FromSeconds(Math.Abs(seconds));
+        var s = $"{(seconds < 0 ? '-' : '+')}{(int)ts.TotalHours}:{ts.Minutes:00}:{ts.Seconds:00}";
+        return ts.Milliseconds > 0 ? s + $".{ts.Milliseconds:000}" : s;
+    }
+
+    public static bool TryParseShift(string text, out double seconds)
+    {
+        seconds = 0;
+        var m = Regex.Match(text.Trim(), @"^([+-]?)(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)$");
+        if (m.Success)
+        {
+            double h = m.Groups[2].Success ? double.Parse(m.Groups[2].Value, CultureInfo.InvariantCulture) : 0;
+            seconds = h * 3600 + double.Parse(m.Groups[3].Value, CultureInfo.InvariantCulture) * 60
+                    + double.Parse(m.Groups[4].Value, CultureInfo.InvariantCulture);
+        }
+        else if (!double.TryParse(text.Trim().TrimStart('+'), NumberStyles.Float, CultureInfo.InvariantCulture, out seconds))
+            return false;
+        if (m.Success && m.Groups[1].Value == "-") seconds = -seconds;
+        return true;
     }
 }
 
@@ -82,14 +128,18 @@ sealed class Template
         int pos = 0;
         foreach (Match m in TokenRx.Matches(text))
         {
-            if (m.Index > pos) parts.Add((text[pos..m.Index], null, null));
+            if (m.Index > pos) parts.Add((Literal(text[pos..m.Index]), null, null));
             var token = m.Groups[1].Value.ToLowerInvariant();
             parts.Add((m.Value, token, m.Groups[2].Success ? m.Groups[2].Value : null));
             if (PerFrame.Contains(token)) IsDynamic = true;
             pos = m.Index + m.Length;
         }
-        if (pos < text.Length) parts.Add((text[pos..], null, null));
+        if (pos < text.Length) parts.Add((Literal(text[pos..]), null, null));
     }
+
+    // Typing \n starts a new line (the overlay text box is a single line)
+    const string NewLine = "\\n";
+    static string Literal(string s) => s.Replace(NewLine, "\n");
 
     public string Render(TemplateContext c, int frame, double rel)
     {
@@ -122,9 +172,15 @@ sealed class Template
         };
     }
 
-    static string Fmt(DateTimeOffset t, string format)
+    // .NET date formatting, plus \n for a new line. Each line is formatted on its own; a
+    // one-letter line gets a % so it's read as a custom code ("d" alone would be a whole date).
+    public static string Fmt(DateTimeOffset t, string format)
     {
-        try { return t.ToString(format, Inv); }
+        try
+        {
+            return string.Join("\n", format.Split(NewLine).Select(part =>
+                part.Length == 0 ? "" : t.ToString(part.Length == 1 ? "%" + part : part, Inv)));
+        }
         catch (FormatException) { return "(invalid format)"; }
     }
 

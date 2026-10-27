@@ -11,7 +11,13 @@ pick a style, and click Run.
 ## Features
 
 - **Per-frame, sub-second labels** such as `2026-10-25 15:48:14.033`. Each frame gets its own value.
-- **Any number of text overlays**, in any of 9 positions, each with its own font, size and color. Rows use the Style font unless you pick another in the *Font* column; a warning appears if a font's digits vary in width, which makes changing numbers wobble. Fill the text with tokens:
+- **Any number of text overlays**, in any of 9 positions:
+  - **Each row has its own** font, size, color and edge (outline, box behind text, shadow or none).
+  - **Rows at the same position stack** in list order, and can line up by their left edges, centers or right edges.
+  - **Type `\n` for a new line**, in the text or in a date format.
+  - **Font warnings:** an orange Font cell means either the font's digits vary in width (changing numbers wobble), or it reserves very tall lines, so its letters come out tiny (see [Fonts](#fonts)).
+
+  Fill the text with tokens:
 
   | Token | Shows |
   |---|---|
@@ -83,6 +89,49 @@ Everything lives in `%LOCALAPPDATA%\VideoTimecode` (for example
 | `last-run.log`, `error.log` | Details of the last run, and of any unexpected errors |
 | `ffmpeg\` | FFmpeg, if the app downloaded it |
 
+## Date and time format
+
+*Label format* (used by `{datetime}`) and custom formats inside tokens, like
+`{datetime:h:mm tt}`, `{date:dddd}` or `{time:HH:mm:ss}`, use these codes. **Format
+help...** next to Label format shows them with live examples.
+
+| Code | Shows | Example |
+|---|---|---|
+| `yyyy` / `yy` | Year | 2026 / 26 |
+| `MMMM` / `MMM` / `MM` / `M` | Month: name / short name / 2 digits / number | October / Oct / 10 / 10 |
+| `dddd` / `ddd` | Day of the week / short | Monday / Mon |
+| `dd` / `d` | Day of the month, 2 digits / number | 05 / 5 |
+| `hh` / `h` | Hour, 12-hour clock, 2 digits / number | 05 / 5 |
+| `HH` / `H` | Hour, 24-hour clock, 2 digits / number | 17 / 17 |
+| `mm` / `m` | Minutes, 2 digits / number | 03 / 3 |
+| `ss` / `s` | Seconds, 2 digits / number | 09 / 9 |
+| `f` `ff` `fff` | Tenths / hundredths / milliseconds (up to `fffffff`) | 1 / 12 / 123 |
+| `F` `FF` `FFF` | Same, trailing zeros dropped | 12 instead of 120 |
+| `tt` / `t` | AM/PM / A/P | PM / P |
+| `zzz` / `zz` / `z` | UTC offset | -07:00 / -07 / -7 |
+| `g` | Era | A.D. |
+| `\n` | New line | |
+| `'text'` | Text shown as typed | `'at'` |
+| `\x` | One character shown as typed | `\h` shows h |
+
+Letters are case-sensitive (`MM` = month, `mm` = minutes). Spaces and `: / - , .` appear as
+typed. Month and day names are in English.
+
+For example, `h:mm tt\ndddd, MMMM d, yyyy` gives
+
+```
+5:23 PM
+Friday, October 23, 2026
+```
+
+## Fonts
+
+Each overlay can use its own font. **Avoid math and some symbol fonts such as Cambria
+Math.** They reserve very tall lines for big symbols, and subtitle renderers size text by that
+line height, so the letters come out at a fraction of the chosen size: Cambria Math renders
+at about 18%. The app flags these fonts in orange, leaves them out of the quick font list,
+and the preview shows them at their real, small size.
+
 ## Output files
 
 Outputs are written next to each video. Your originals are never changed.
@@ -140,6 +189,12 @@ device does. On the Sony FDR-AX43 the embedded date is the start: the camera wri
 thumbnail when recording begins and the XML when it stops, and the embedded time matches
 the thumbnail. If your device stamps the end, choose *End of recording*. To check a new
 device, film a clock that shows seconds and compare it with the timecode.
+
+**Start time** under *Time* overrides the file:
+
+- **From the file:** as above.
+- **From the file, shifted by** `+h:mm:ss` or `-h:mm:ss`: corrects a camera clock that was set wrong, e.g. `-1:00:00` if it was an hour fast. It applies to every video in the batch.
+- **Set manually:** the date and time of the first frame (to the millisecond), in the chosen time zone. This also works for files that store no date, such as `.mpg`.
 
 ## Command line
 
