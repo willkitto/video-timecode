@@ -19,7 +19,10 @@ sealed class PreviewPanel : Control
 
     public PreviewPanel()
     {
-        SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+        SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint
+                 | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
+        TabStop = true;
+        AccessibleName = Text = "Preview";
     }
 
     // Largest 16:9 frame that fits
@@ -89,15 +92,17 @@ sealed class PreviewPanel : Control
 
         bool Shown(Overlay o) => o.Enabled && (o.IsImage ? OverlayImages.SizeOf(o.ImagePath!) != null : !string.IsNullOrWhiteSpace(o.Text));
         bool imagesBurned = s.Mode == OutputMode.Burn;
+        hits.Clear();
 
-        foreach (var grp in s.Overlays.Where(Shown).GroupBy(o => o.Position))
+        foreach (var grp in s.Overlays.Select((o, i) => (O: o, I: i)).Where(x => Shown(x.O)).GroupBy(x => x.O.Position))
         {
             var align = s.Alignments.GetValueOrDefault(grp.Key);
-            var rows = grp.Select(o =>
+            var rows = grp.Select(x =>
             {
+                var o = x.O;
                 double px = frame.Height * o.Size / 100;
                 var edge = o.Edge ?? s.Edge;
-                return (O: o, Text: new Template(o.Text).Render(ctx, 122, 4.07).Replace("\r", ""), Px: px,
+                return (O: o, Index: x.I, Text: new Template(o.Text).Render(ctx, 122, 4.07).Replace("\r", ""), Px: px,
                         Font: o.FontName ?? s.FontName, Bold: o.Bold ?? s.Bold, Edge: edge,
                         EdgeColor: ColorUtil.Parse(o.EdgeColor ?? s.EdgeColor), Pad: edge == EdgeStyle.Box ? Math.Max(1, px / 5) : 0);
             }).ToList();
@@ -113,10 +118,13 @@ sealed class PreviewPanel : Control
             {
                 var r = rows[k];
                 var p = places[k];
+                var size = sizes[k];
+                double left = p.An switch { 7 => p.X, 8 => p.X - size.Width / 2, _ => p.X - size.Width };
+                // Remember where it went, for clicking and dragging
+                hits.Add((r.Index, new RectangleF((float)(frame.Left + left - size.Pad), (float)(frame.Top + p.Y - size.Pad),
+                    (float)(size.Width + 2 * size.Pad), (float)(size.Lines * size.Px + 2 * size.Pad))));
                 if (r.O.IsImage)
                 {
-                    var size = sizes[k];
-                    double left = p.An switch { 7 => p.X, 8 => p.X - size.Width / 2, _ => p.X - size.Width };
                     DrawImage(g, r.O.ImagePath!, new RectangleF((float)(frame.Left + left), (float)(frame.Top + p.Y), (float)size.Width, (float)size.Px), imagesBurned);
                     continue;
                 }
@@ -126,9 +134,115 @@ sealed class PreviewPanel : Control
                         frame.Left + p.X, frame.Top + p.Y + li * r.Px, p.An);
             }
         }
+
+        // Selection outline, and where a dragged overlay would land
+        foreach (var (index, rect) in hits.Where(h => h.Index == Selected))
+        {
+            var box = RectangleF.Inflate(rect, 4, 4);
+            using var outer = new Pen(Color.Black, 3);
+            using var inner = new Pen(Color.FromArgb(255, 80, 200, 255), 1.5f) { DashStyle = DashStyle.Dash };
+            g.DrawRectangle(outer, box.X, box.Y, box.Width, box.Height);
+            g.DrawRectangle(inner, box.X, box.Y, box.Width, box.Height);
+        }
+        if (dragging && dropTarget is { } d)
+        {
+            int col = ((int)d - 1) % 3, band = ((int)d - 1) / 3;
+            float cx = frame.Left + col * frame.Width / 3, cy = frame.Top + (2 - band) * frame.Height / 3;
+            float y = dropAtTop ? cy + 3 : cy + frame.Height / 3 - 3;
+            using var bar = new Pen(Color.FromArgb(255, 80, 200, 255), 4);
+            g.DrawLine(bar, cx + 6, y, cx + frame.Width / 3 - 6, y);
+        }
     }
 
-    readonly Dictionary<string, (DateTime Stamp, Bitmap Image)> imageCache = new(StringComparer.OrdinalIgnoreCase);
+    // --- select, drag to move, wheel to resize -------------------------------------
+
+    // Index (in the overlay list) of the selected overlay, if any
+    int? selected;
+    [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+    public int? Selected
+    {
+        get => selected;
+        set { if (selected != value) { selected = value; Invalidate(); } }
+    }
+
+    public event Action<int?>? OverlaySelected;                 // clicked an overlay (or empty space)
+    public event Action<int, Anchor9, bool>? OverlayMoved;       // index, new position, at top of its stack
+    public event Action<int, int>? OverlayResized;               // index, wheel notches (+ bigger)
+
+    readonly List<(int Index, RectangleF Rect)> hits = new();
+    int? dragIndex;          // set while the left button is held on an overlay
+    Point dragFrom;
+    bool dragging, dropAtTop;
+
+    int? HitTest(Point p)
+    {
+        for (int i = hits.Count - 1; i >= 0; i--)
+            if (RectangleF.Inflate(hits[i].Rect, 4, 4).Contains(p)) return hits[i].Index;
+        return null;
+    }
+
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        base.OnMouseDown(e);
+        Focus();   // so the mouse wheel comes here
+        if (e.Button != MouseButtons.Left) return;
+        var hit = HitTest(e.Location);
+        Selected = hit;
+        OverlaySelected?.Invoke(hit);
+        dragIndex = hit;
+        dragFrom = e.Location;
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        base.OnMouseMove(e);
+        if (dragIndex != null)
+        {
+            var size = SystemInformation.DragSize;
+            if (!dragging && (Math.Abs(e.X - dragFrom.X) > size.Width || Math.Abs(e.Y - dragFrom.Y) > size.Height)) dragging = true;
+            if (dragging)
+            {
+                var f = Frame();
+                float cellTop = f.Top + (2 - ((int)AnchorAt(e.Location) - 1) / 3) * f.Height / 3;
+                dropAtTop = e.Y < cellTop + f.Height / 6;
+                DropTarget = AnchorAt(e.Location);
+                Invalidate();
+                Cursor = Cursors.SizeAll;
+                return;
+            }
+        }
+        Cursor = HitTest(e.Location) != null ? Cursors.Hand : Cursors.Default;
+    }
+
+    protected override void OnMouseUp(MouseEventArgs e)
+    {
+        base.OnMouseUp(e);
+        if (e.Button != MouseButtons.Left) return;
+        if (dragging && dragIndex is { } i && dropTarget is { } target)
+            OverlayMoved?.Invoke(i, target, dropAtTop);
+        dragging = false;
+        dragIndex = null;
+        DropTarget = null;
+        Cursor = HitTest(e.Location) != null ? Cursors.Hand : Cursors.Default;
+    }
+
+    protected override void OnMouseWheel(MouseEventArgs e)
+    {
+        base.OnMouseWheel(e);
+        if (Selected is not { } i) return;
+        if (e is HandledMouseEventArgs h) h.Handled = true;
+        int notches = e.Delta / 120;
+        if (notches == 0) notches = Math.Sign(e.Delta);
+        OverlayResized?.Invoke(i, notches);
+    }
+
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        base.OnKeyDown(e);
+        if (e.KeyCode == Keys.Escape) { Selected = null; OverlaySelected?.Invoke(null); }
+    }
+    // Pictures as last loaded; reloaded if the file changes or FFmpeg turns up (it reads GIF transparency)
+    readonly Dictionary<string, (DateTime Stamp, bool FfmpegReady, Bitmap Image)> imageCache = new(StringComparer.OrdinalIgnoreCase);
 
     // A picture overlay; faded with a dashed border when the output type can't include it
     void DrawImage(Graphics g, string path, RectangleF r, bool burned)
@@ -137,10 +251,11 @@ sealed class PreviewPanel : Control
         try
         {
             var stamp = File.GetLastWriteTimeUtc(path);
-            if (!imageCache.TryGetValue(path, out var cached) || cached.Stamp != stamp)
+            bool ready = Ffmpeg.Ready;
+            if (!imageCache.TryGetValue(path, out var cached) || cached.Stamp != stamp || cached.FfmpegReady != ready)
             {
                 if (imageCache.TryGetValue(path, out var old)) old.Image.Dispose();
-                imageCache[path] = cached = (stamp, OverlayImages.Load(path));
+                imageCache[path] = cached = (stamp, ready, OverlayImages.Load(path));
             }
             img = cached.Image;
         }

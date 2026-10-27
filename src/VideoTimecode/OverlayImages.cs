@@ -33,9 +33,37 @@ static class OverlayImages
     // Loads a copy, so the file isn't kept locked
     public static Bitmap Load(string path)
     {
+        // Windows' reader ignores the transparency in many GIFs (e.g. ones FFmpeg writes), so let
+        // FFmpeg - which does the burn-in - decode them, and the preview matches the output
+        if (Path.GetExtension(path).Equals(".gif", StringComparison.OrdinalIgnoreCase) && Ffmpeg.Ready
+            && DecodeWithFfmpeg(path) is { } decoded)
+            return decoded;
+
         using var ms = new MemoryStream(File.ReadAllBytes(path));
         using var img = Image.FromStream(ms);
         return new Bitmap(img);
+    }
+
+    // First frame as 32-bit RGBA via FFmpeg, or null if that fails
+    static Bitmap? DecodeWithFfmpeg(string path)
+    {
+        var png = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"vtc_img_{Guid.NewGuid():N}.png");
+        try
+        {
+            // Run off this thread: the preview calls this from the UI thread, which must not wait on itself
+            var r = Task.Run(() => Ffmpeg.RunAsync(Ffmpeg.FfmpegPath!,
+                new[] { "-v", "error", "-y", "-i", path, "-frames:v", "1", "-pix_fmt", "rgba", png },
+                timeout: TimeSpan.FromSeconds(15))).GetAwaiter().GetResult();
+            if (r.Code != 0 || !File.Exists(png)) return null;
+            using var ms = new MemoryStream(File.ReadAllBytes(png));
+            using var img = Image.FromStream(ms);
+            return new Bitmap(img);
+        }
+        catch { return null; }
+        finally
+        {
+            try { File.Delete(png); } catch { }
+        }
     }
 
     // Scaled size for a row: height is Size % of the frame height, width keeps the aspect ratio

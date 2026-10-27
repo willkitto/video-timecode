@@ -367,7 +367,7 @@ sealed class MainForm : Form
             (overlayButtons, 0),
             (Header("Style"), 0),
             (style, 0),
-            (Header("Preview"), 0),
+            (Header("Preview  (click to select, drag to move, mouse wheel to resize)"), 0),
             (preview, 62));
     }
 
@@ -516,6 +516,15 @@ sealed class MainForm : Form
             }
         };
         // Pictures: drop on the preview to place one where it lands, or on the table for a free position
+        // Select in the preview <-> highlight in the table; drag to move; wheel to resize
+        preview.OverlaySelected += HighlightRow;
+        preview.OverlayMoved += MoveOverlayTo;
+        preview.OverlayResized += ResizeOverlay;
+        grid.CurrentCellChanged += (_, _) =>
+        {
+            if (grid.CurrentCell is { } c && c.RowIndex >= 0 && c.RowIndex < overlays.Count) preview.Selected = c.RowIndex;
+        };
+
         preview.AllowDrop = grid.AllowDrop = true;
         preview.DragOver += (_, e) =>
         {
@@ -535,7 +544,8 @@ sealed class MainForm : Form
         grid.CellBeginEdit += (_, e) =>
         {
             // A picture row's Text cell shows the file; double-click it to pick another picture
-            if (e.RowIndex >= 0 && e.RowIndex < overlays.Count && overlays[e.RowIndex].IsImage) e.Cancel = true;
+            if (e.RowIndex >= 0 && e.RowIndex < overlays.Count && overlays[e.RowIndex].IsImage
+                && grid.Columns[e.ColumnIndex].Name == "Text") e.Cancel = true;
         };
         grid.CellDoubleClick += (_, e) =>
         {
@@ -693,6 +703,7 @@ sealed class MainForm : Form
             SetStatus("FFmpeg is needed to read videos. Click Run to download it.");
             return;
         }
+        preview.Invalidate();   // FFmpeg is available now; GIF pictures redraw with their transparency
         await DetectEncodersAsync();
         if (quickRun) await RunAsync(fromSetup: true);
     }
@@ -1222,6 +1233,49 @@ sealed class MainForm : Form
         menu.Closed += (_, _) => BeginInvoke(menu.Dispose);
         var r = grid.GetCellDisplayRectangle(col, row, false);
         menu.Show(grid, new Point(r.Left, r.Bottom));
+    }
+
+    // Marks an overlay's row in the table without moving the focus there (the preview keeps the wheel)
+    void HighlightRow(int? row)
+    {
+        grid.EndEdit();
+        grid.ClearSelection();
+        if (row is not { } r || r < 0 || r >= overlays.Count) return;
+        grid.Rows[r].Cells["Text"].Selected = true;
+        if (!grid.Rows[r].Displayed) grid.FirstDisplayedScrollingRowIndex = r;
+    }
+
+    // Dragged in the preview: move to the new position, at the top or bottom of the rows already there
+    void MoveOverlayTo(int index, Anchor9 pos, bool atTop)
+    {
+        if (index < 0 || index >= overlays.Count) return;
+        grid.EndEdit();
+        var o = overlays[index];
+        overlays.RemoveAt(index);
+        o.Position = pos;
+        var there = overlays.Select((x, k) => (x, k)).Where(t => t.x.Position == pos).Select(t => t.k).ToList();
+        int at = there.Count == 0 ? overlays.Count : atTop ? there[0] : there[^1] + 1;
+        overlays.Insert(at, o);
+        preview.Selected = at;
+        HighlightRow(at);
+        grid.Invalidate();
+        preview.Invalidate();
+        SetStatus($"Moved to {Positions.First(p => p.Value == pos).Name.ToLowerInvariant()}" +
+                  (there.Count > 0 ? $", {(atTop ? "above" : "below")} the rows already there." : "."));
+    }
+
+    // Mouse wheel on the preview: about 8% bigger or smaller per notch
+    void ResizeOverlay(int index, int notches)
+    {
+        if (index < 0 || index >= overlays.Count) return;
+        grid.EndEdit();
+        var o = overlays[index];
+        double size = Math.Round(o.Size * Math.Pow(1.08, notches), 1);
+        if (size == o.Size) size = Math.Round(o.Size + 0.1 * Math.Sign(notches), 1);
+        o.Size = Math.Clamp(size, 0.5, 100);
+        grid.InvalidateRow(index);
+        preview.Invalidate();
+        SetStatus($"Size {o.Size:0.#}% of the video height.");
     }
 
     // Sorts dropped files: pictures become overlays, everything else goes to the video list

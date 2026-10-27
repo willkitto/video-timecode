@@ -17,6 +17,12 @@ pick a style, and click Run.
   - **Type `\n` for a new line**, in the text or in a date format.
   - **Font warnings:** an orange Font cell means either the font's digits vary in width (changing numbers wobble), or it reserves very tall lines, so its letters come out tiny (see [Fonts](#fonts)).
 - **Pictures** (logos, banners): drop a PNG, JPG, BMP, GIF or TIFF onto the preview and it goes in the position you drop it on. Dropping it on the overlay table or the window, or using *Add overlay → Picture...*, also works. A picture row stacks and lines up with text rows, *Size %* sets its height, and transparency is kept. Double-click its row to swap the file. Pictures can only be **burned in**: subtitle files can't hold them.
+- **Arrange in the preview:**
+  - **Click** an overlay to select it; its table row is highlighted.
+  - **Drag** it to another position. Drop in the upper or lower half of an area to put it above or below the rows already there.
+  - **Scroll the mouse wheel** to make the selected overlay bigger or smaller.
+
+  The Position menu and Size column in the table work too.
 - **Never overwrites anything:** if an output name is taken, the next free one is used (see [Output files](#output-files)).
 
   Fill the text with tokens:
